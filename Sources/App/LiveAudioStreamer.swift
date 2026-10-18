@@ -10,6 +10,8 @@ public final class RealtimeAudioRingBuffer {
     private var readHead: Int = 0
     private var lock = os_unfair_lock_s()
     
+    private(set) public var droppedSampleCount: Int = 0
+    
     public init(capacity: Int = 131072) { // 131,072 samples = 8.192 seconds at 16kHz
         self.capacity = capacity
         self.buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacity)
@@ -25,18 +27,23 @@ public final class RealtimeAudioRingBuffer {
         os_unfair_lock_lock(&lock)
         writeHead = 0
         readHead = 0
+        droppedSampleCount = 0
         os_unfair_lock_unlock(&lock)
     }
     
     /// Called on CoreAudio real-time I/O thread: zero allocations, microsecond execution time.
-    public func write(from source: UnsafePointer<Float>, count: Int) {
-        guard count > 0 else { return }
+    @discardableResult
+    public func write(from source: UnsafePointer<Float>, count: Int) -> Int {
+        guard count > 0 else { return 0 }
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         
         let available = capacity - (writeHead - readHead)
         let toWrite = min(count, max(0, available))
-        guard toWrite > 0 else { return } // Ring buffer full: drop to prevent overrun
+        if toWrite < count {
+            droppedSampleCount += (count - toWrite)
+        }
+        guard toWrite > 0 else { return 0 }
         
         let startIdx = writeHead % capacity
         let firstChunk = min(toWrite, capacity - startIdx)
@@ -47,9 +54,10 @@ public final class RealtimeAudioRingBuffer {
             buffer.assign(from: source.advanced(by: firstChunk), count: secondChunk)
         }
         writeHead += toWrite
+        return toWrite
     }
     
-    /// Drains pending samples into target buffer. CoreAudio thread is never blocked.
+    /// Drains pending samples into target buffer safely while protecting buffer memory.
     public func drain(into target: inout [Float]) {
         os_unfair_lock_lock(&lock)
         let available = writeHead - readHead
@@ -62,14 +70,14 @@ public final class RealtimeAudioRingBuffer {
         let firstChunk = min(available, capacity - startIdx)
         let secondChunk = available - firstChunk
         
-        readHead += available
-        os_unfair_lock_unlock(&lock)
-        
         target.reserveCapacity(target.count + available)
         target.append(contentsOf: UnsafeBufferPointer(start: buffer.advanced(by: startIdx), count: firstChunk))
         if secondChunk > 0 {
             target.append(contentsOf: UnsafeBufferPointer(start: buffer, count: secondChunk))
         }
+        
+        readHead += available
+        os_unfair_lock_unlock(&lock)
     }
     
     public var pendingSampleCount: Int {
@@ -186,9 +194,9 @@ public final class LiveAudioStreamer {
                 self.onVolumeChanged?(maxRms)
             }
             
-            // Issue 2 Fix: Zero dynamic memory allocation on CoreAudio real-time thread.
-            // Reset frameLength on pre-allocated conversionBuffer and convert in-place.
-            convertedBuffer.frameLength = 0
+            // Zero dynamic memory allocation on CoreAudio real-time thread.
+            // Reset frameLength to full capacity on pre-allocated conversionBuffer and convert in-place.
+            convertedBuffer.frameLength = convertedBuffer.frameCapacity
             var error: NSError?
             var isDone = false
             let inputBlock: AVAudioConverterInputBlock = { _, outStatus in

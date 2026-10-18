@@ -219,26 +219,49 @@ public final class AudioTranscriber {
         return dir
     }
     
+    /// Physical core count on macOS (Intel & Apple Silicon), preventing hyperthreading contention
+    public static var physicalCoreCount: Int {
+        var count: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        if sysctlbyname("hw.physicalcpu", &count, &size, nil, 0) == 0 && count > 0 {
+            return Int(count)
+        }
+        return max(1, ProcessInfo.processInfo.activeProcessorCount / 2)
+    }
+    
     /// Resolves the absolute path for a model file name or returns a standard fallback.
     public static func resolveModelPath(named name: String = "futo-english-39.bin") -> String? {
-        let candidates = [
-            // 1. XDG Models Directory (~/.local/share/voiceboy/models)
-            xdgModelsDirectory.appendingPathComponent(name).path,
-            // 2. Bundle Resources
-            Bundle.main.path(forResource: (name as NSString).deletingPathExtension, ofType: (name as NSString).pathExtension),
-            Bundle.main.resourceURL?.appendingPathComponent(name).path,
-            Bundle.main.resourceURL?.appendingPathComponent("models/\(name)").path,
-            // 3. Fallback for CLI development in repo
-            URL(fileURLWithPath: "models/\(name)").path,
-            URL(fileURLWithPath: name).path,
-            // 4. Relative to binary
-            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("models/\(name)").path,
-            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("../Resources/models/\(name)").path
-        ].compactMap { $0 }
+        let requestedCandidates = [name] + (name == "futo-english-39.bin" ? knownModels.map { $0.filename } : [])
         
-        for candidate in candidates {
-            if FileManager.default.fileExists(atPath: candidate) {
-                return candidate
+        for candidateName in requestedCandidates {
+            // Absolute path check
+            if candidateName.hasPrefix("/") && FileManager.default.fileExists(atPath: candidateName) {
+                return candidateName
+            }
+            
+            // Path traversal sanitization (Section 9)
+            let safeName = URL(fileURLWithPath: candidateName).lastPathComponent
+            guard !safeName.isEmpty && safeName != "." && safeName != ".." else { continue }
+            
+            let candidates = [
+                // 1. XDG Models Directory (~/.local/share/voiceboy/models)
+                xdgModelsDirectory.appendingPathComponent(safeName).path,
+                // 2. Bundle Resources
+                Bundle.main.path(forResource: (safeName as NSString).deletingPathExtension, ofType: (safeName as NSString).pathExtension),
+                Bundle.main.resourceURL?.appendingPathComponent(safeName).path,
+                Bundle.main.resourceURL?.appendingPathComponent("models/\(safeName)").path,
+                // 3. Fallback for CLI development in repo
+                URL(fileURLWithPath: "models/\(safeName)").path,
+                URL(fileURLWithPath: safeName).path,
+                // 4. Relative to binary
+                Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("models/\(safeName)").path,
+                Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("../Resources/models/\(safeName)").path
+            ].compactMap { $0 }
+            
+            for candidate in candidates {
+                if FileManager.default.fileExists(atPath: candidate) {
+                    return candidate
+                }
             }
         }
         return nil
@@ -297,7 +320,8 @@ public final class AudioTranscriber {
                 throw TranscriberError.emptyAudio
             }
             
-            let threads = Int32(min(8, max(1, ProcessInfo.processInfo.activeProcessorCount)))
+            // Subsystem E: Bind thread count to physical cores on Intel to prevent hyperthreading cache thrashing
+            let threads = Int32(min(8, max(1, AudioTranscriber.physicalCoreCount)))
             
             let dur = audioData.trimmedDurationSec
             let isLongAudio = dur > 30.0
@@ -363,6 +387,11 @@ public final class AudioTranscriber {
             if self.abortFlag != 0 || status != 0 {
                 if self.abortFlag != 0 {
                     throw TranscriberError.transcriptionCancelled
+                }
+                // Free corrupted context so subsequent calls re-initialize cleanly
+                if let ctx = self.context {
+                    whisper_free(ctx)
+                    self.context = nil
                 }
                 throw TranscriberError.transcriptionFailed(status)
             }

@@ -39,7 +39,11 @@ if [[ ! -f "$whisper_lib" ]]; then
         -DWHISPER_BUILD_TESTS=OFF \
         -DWHISPER_BUILD_SERVER=OFF \
         -DGGML_METAL=OFF \
-        -DGGML_BLAS_DEFAULT=ON
+        -DGGML_BLAS_DEFAULT=ON \
+        -DGGML_AVX=ON \
+        -DGGML_AVX2=ON \
+        -DGGML_FMA=ON \
+        -DGGML_F16C=ON
     cmake --build "${project_dir}/deps/whisper.cpp/build-static" --config Release -j "$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
     libtool -static -o "$whisper_lib" \
         "${project_dir}/deps/whisper.cpp/build-static/src/libwhisper.a" \

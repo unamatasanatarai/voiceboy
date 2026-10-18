@@ -13,9 +13,38 @@ public final class TextPaster {
         lock.unlock()
     }
     
+    /// Checks if the frontmost focused UI element is a secure text input (password field)
+    public static func isTargetSecureInput() -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedElement: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
+        guard status == .success, let element = focusedElement else { return false }
+        
+        var subrole: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSubroleAttribute as CFString, &subrole) == .success,
+           let subroleStr = subrole as? String,
+           subroleStr == "AXSecureTextField" {
+            return true
+        }
+        return false
+    }
+    
     public static func paste(text: String, copyToClipboard: Bool = AppState.shared.copyToClipboard) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        
+        // Security check (Scenario 10): Block injection into password / secure-entry fields
+        if isTargetSecureInput() {
+            DispatchQueue.main.async {
+                AppState.shared.statusMessage = "Dictation blocked: Password field detected"
+                ToastWindowController.shared.showToast(status: "Blocked", text: "Password field detected", audioLevel: 0.0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    ToastWindowController.shared.hideToast()
+                }
+            }
+            return
+        }
         
         // Debounce protection: prevent duplicate paste calls within a 300ms window
         lock.lock()
@@ -49,6 +78,7 @@ public final class TextPaster {
         
         pasteboard.clearContents()
         pasteboard.setString(trimmed, forType: .string)
+        let expectedChangeCount = pasteboard.changeCount
         
         // 3. Ensure accessibility permission is active
         if !AXIsProcessTrusted() {
@@ -61,9 +91,13 @@ public final class TextPaster {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
             simulatePaste()
             
-            // 5. If user disabled "copy to clipboard", restore previous clipboard contents after paste completes
+            // 5. If user disabled "copy to clipboard", restore previous clipboard contents after paste completes,
+            // but ONLY if the user or another app has not copied new content in the interim (Scenario 11)
             if !copyToClipboard {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    guard pasteboard.changeCount == expectedChangeCount else {
+                        return // User or external clipboard manager modified clipboard; do not overwrite
+                    }
                     pasteboard.clearContents()
                     for itemData in savedItems {
                         let newItem = NSPasteboardItem()

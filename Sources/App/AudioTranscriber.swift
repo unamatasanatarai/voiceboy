@@ -9,6 +9,7 @@ public struct TranscriptionResult {
     public let audioContextSize: Int
     public let modelPath: String
     public let modelName: String
+    public let isSilence: Bool
     
     /// Formats seconds into human-readable text (e.g. "14.2s", "1m 24s", "2h 15m")
     public static func formatHumanDuration(seconds: Double) -> String {
@@ -60,6 +61,7 @@ public enum TranscriberError: LocalizedError {
     case modelNotFound(String)
     case contextInitializationFailed(String)
     case transcriptionFailed(Int32)
+    case transcriptionCancelled
     case emptyAudio
     
     public var errorDescription: String? {
@@ -70,6 +72,8 @@ public enum TranscriberError: LocalizedError {
             return "Failed to initialize Whisper engine context: \(msg)"
         case .transcriptionFailed(let code):
             return "Transcription engine returned error code \(code)"
+        case .transcriptionCancelled:
+            return "Transcription was cancelled by user"
         case .emptyAudio:
             return "Provided audio stream contains no valid samples"
         }
@@ -81,6 +85,9 @@ public final class AudioTranscriber {
     private var currentModelPath: String?
     private let queue = DispatchQueue(label: "org.futo.voiceboy.transcriber", qos: .userInitiated)
     
+    // Issue 5 Fix: Atomic abort flag for native ggml_abort_callback
+    private var abortFlag: Int32 = 0
+    
     public static let shared = AudioTranscriber()
     
     public init() {}
@@ -89,6 +96,16 @@ public final class AudioTranscriber {
         if let ctx = context {
             whisper_free(ctx)
         }
+    }
+    
+    /// Requests immediate cancellation of any active in-flight whisper_full inference call.
+    public func abortCurrentTranscription() {
+        abortFlag = 1
+    }
+    
+    /// Clears any pending cancellation request before starting a new dictation session.
+    public func resetAbort() {
+        abortFlag = 0
     }
     
     public struct ModelInfo: Identifiable, Hashable {
@@ -100,6 +117,8 @@ public final class AudioTranscriber {
         public let bestFor: String
         public let recommendation: String
         public let downloadURL: String
+        public let expectedSizeBytes: Int64
+        public let sha256: String
         
         public init(
             filename: String,
@@ -108,7 +127,9 @@ public final class AudioTranscriber {
             parameterCount: String,
             bestFor: String,
             recommendation: String,
-            downloadURL: String
+            downloadURL: String,
+            expectedSizeBytes: Int64,
+            sha256: String
         ) {
             self.filename = filename
             self.displayName = displayName
@@ -117,6 +138,8 @@ public final class AudioTranscriber {
             self.bestFor = bestFor
             self.recommendation = recommendation
             self.downloadURL = downloadURL
+            self.expectedSizeBytes = expectedSizeBytes
+            self.sha256 = sha256
         }
     }
     
@@ -129,7 +152,9 @@ public final class AudioTranscriber {
             parameterCount: "39M params (~43 MB)",
             bestFor: "Default, best for quick processing - fastest",
             recommendation: "Ideal for real-time live dictation and streaming with ultra-low latency.",
-            downloadURL: "https://keyboard.futo.org/voice-input-english-39.bin"
+            downloadURL: "https://keyboard.futo.org/voice-input-english-39.bin",
+            expectedSizeBytes: 43550795,
+            sha256: "4b5480aa1b14a7efc5b578ef176510970a898049671c3cd237285b3e3f6bfbfc"
         ),
         ModelInfo(
             filename: "voice-input-english-74.bin",
@@ -138,7 +163,9 @@ public final class AudioTranscriber {
             parameterCount: "74M params (~82 MB)",
             bestFor: "Balance between speed and accuracy - fast",
             recommendation: "Great for everyday dictation where you want improved accuracy on uncommon words.",
-            downloadURL: "https://keyboard.futo.org/voice-input-english-74.bin"
+            downloadURL: "https://keyboard.futo.org/voice-input-english-74.bin",
+            expectedSizeBytes: 81781811,
+            sha256: "e9b4b7b81b8a28769e8aa9962aa39bb9f21b622cf6a63982e93f065ed5caf1c8"
         ),
         ModelInfo(
             filename: "voice-input-english-244.bin",
@@ -147,7 +174,9 @@ public final class AudioTranscriber {
             parameterCount: "244M params (~264 MB)",
             bestFor: "Most accurate results - slow",
             recommendation: "Recommended for complex audio, heavy accents, noisy environments, or technical jargon.",
-            downloadURL: "https://keyboard.futo.org/voice-input-english-244.bin"
+            downloadURL: "https://keyboard.futo.org/voice-input-english-244.bin",
+            expectedSizeBytes: 264477561,
+            sha256: "58fbe949992dafed917590d58bc12ca577b08b9957f0b3e0d7ee71b64bed3aa8"
         ),
         // Multilingual Models
         ModelInfo(
@@ -157,7 +186,9 @@ public final class AudioTranscriber {
             parameterCount: "74M params (~82 MB)",
             bestFor: "Balance between speed and accuracy - fast",
             recommendation: "Recommended for Chinese, German, Spanish, Russian, French, Portuguese, Korean, and Japanese.",
-            downloadURL: "https://keyboard.futo.org/voice-input-multilingual-74.bin"
+            downloadURL: "https://keyboard.futo.org/voice-input-multilingual-74.bin",
+            expectedSizeBytes: 81768602,
+            sha256: "e44f352c9aa2c3609dece20c733c4ad4a75c28cd9ab07d005383df55fa96efc4"
         ),
         ModelInfo(
             filename: "voice-input-multilingual-244.bin",
@@ -166,7 +197,9 @@ public final class AudioTranscriber {
             parameterCount: "244M params (~264 MB)",
             bestFor: "Most accurate results - slow",
             recommendation: "Recommended for all other supported languages and nuanced multilingual speech.",
-            downloadURL: "https://keyboard.futo.org/voice-input-multilingual-244.bin"
+            downloadURL: "https://keyboard.futo.org/voice-input-multilingual-244.bin",
+            expectedSizeBytes: 264464624,
+            sha256: "15ef255465a6dc582ecf1ec651a4618c7ee2c18c05570bbe46493d248d465ac4"
         )
     ]
     
@@ -225,7 +258,6 @@ public final class AudioTranscriber {
         }
         
         var cparams = whisper_context_default_params()
-        // High efficiency settings: use CPU with Accelerate BLAS for zero shader overhead
         cparams.use_gpu = false
         cparams.flash_attn = false
         
@@ -267,15 +299,18 @@ public final class AudioTranscriber {
             
             let threads = Int32(min(8, max(1, ProcessInfo.processInfo.activeProcessorCount)))
             
-            // FUTO ACFT optimization:
-            // Dynamic audio context shrinks the encoder compute window to match the actual audio duration
-            // instead of padding out to 30s (1500 frames).
+            let dur = audioData.trimmedDurationSec
+            let isLongAudio = dur > 30.0
+            
+            // Issue 6 Fix:
+            // For utterances <= 30s, dynamic audio context shrinks the encoder compute window to match actual duration.
+            // For continuous utterances > 30s, targetCtx is set to 0 (full 30s context) and single_segment is false,
+            // enabling whisper.cpp standard multi-segment sliding window processing so trailing audio is not truncated.
             let targetCtx: Int32
-            if useDynamicContext {
-                let dur = audioData.trimmedDurationSec
+            if useDynamicContext && !isLongAudio {
                 targetCtx = Int32(min(1500, max(64, Int(dur * 50.0))))
             } else {
-                targetCtx = 0 // whisper.cpp default: full 30s context
+                targetCtx = 0 // whisper.cpp default: standard 30s context window
             }
             
             var wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
@@ -286,34 +321,49 @@ public final class AudioTranscriber {
             wparams.translate = false
             wparams.n_threads = threads
             wparams.no_context = true
-            wparams.single_segment = true
+            wparams.single_segment = !isLongAudio
             wparams.audio_ctx = targetCtx
             
-            // Language selection:
-            // "auto" or empty string activates whisper's native language detector without translating.
+            // Issue 5 Fix: Hook ggml_abort_callback to enable instant cancellation mid-inference
+            if self.abortFlag != 0 {
+                throw TranscriberError.transcriptionCancelled
+            }
+            wparams.abort_callback = { userData in
+                guard let ptr = userData?.assumingMemoryBound(to: Int32.self) else { return false }
+                return ptr.pointee != 0
+            }
+            
             let resolvedLang: String? = (language.isEmpty || language.lowercased() == "auto") ? nil : language
             
             let start = DispatchTime.now()
-            let status: Int32
-            if let lang = resolvedLang {
-                status = lang.withCString { langPtr in
-                    wparams.language = langPtr
-                    return samples.withUnsafeBufferPointer { buf in
-                        whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
+            var status: Int32 = 0
+            
+            withUnsafeMutablePointer(to: &self.abortFlag) { flagPtr in
+                wparams.abort_callback_user_data = UnsafeMutableRawPointer(flagPtr)
+                
+                if let lang = resolvedLang {
+                    status = lang.withCString { langPtr in
+                        wparams.language = langPtr
+                        return samples.withUnsafeBufferPointer { buf in
+                            whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
+                        }
                     }
-                }
-            } else {
-                // Auto-detect language (Polish, German, English, etc.) - transcribe in spoken language!
-                status = "auto".withCString { autoPtr in
-                    wparams.language = autoPtr
-                    return samples.withUnsafeBufferPointer { buf in
-                        whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
+                } else {
+                    status = "auto".withCString { autoPtr in
+                        wparams.language = autoPtr
+                        return samples.withUnsafeBufferPointer { buf in
+                            whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
+                        }
                     }
                 }
             }
+            
             let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000.0
             
-            guard status == 0 else {
+            if self.abortFlag != 0 || status != 0 {
+                if self.abortFlag != 0 {
+                    throw TranscriberError.transcriptionCancelled
+                }
                 throw TranscriberError.transcriptionFailed(status)
             }
             
@@ -325,15 +375,13 @@ public final class AudioTranscriber {
                 }
             }
             
-            // Clean up whisper artifacts like [BLANK_AUDIO] or extra spaces
-            var cleanText = recognized
+            // Issue 8 Fix: Strip [BLANK_AUDIO] artifacts and do NOT inject diagnostic messages
+            // into recognized output text. Silent audio returns empty text so it never pastes into apps.
+            let cleanText = recognized
                 .replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             
-            if cleanText.isEmpty && !recognized.isEmpty {
-                cleanText = "[Silence / No speech detected]"
-            }
-            
+            let isSilence = cleanText.isEmpty
             let audioDur = audioData.originalDurationSec
             let rtf = audioDur > 0 ? (elapsedMs / 1000.0) / audioDur : 0.0
             let modelName = URL(fileURLWithPath: activeModelPath).lastPathComponent
@@ -346,7 +394,8 @@ public final class AudioTranscriber {
                 realTimeFactor: rtf,
                 audioContextSize: Int(targetCtx),
                 modelPath: activeModelPath,
-                modelName: modelName
+                modelName: modelName,
+                isSilence: isSilence
             )
         }
     }

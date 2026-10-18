@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import Combine
+import CryptoKit
 
 public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloadDelegate {
     public static let shared = ModelDownloadManager()
@@ -77,9 +78,68 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
         }
     }
     
+    // MARK: - Integrity Verification (Issue 11)
+    public static func computeSHA256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while autoreleasepool(invoking: {
+            let chunk = handle.readData(ofLength: 1024 * 1024)
+            if chunk.isEmpty {
+                return false
+            }
+            hasher.update(data: chunk)
+            return true
+        }) {}
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+    
+    public static func verifyFileIntegrity(at url: URL, expectedSize: Int64, expectedSHA256: String) -> (isValid: Bool, error: String?) {
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let fileSize = attrs[.size] as? Int64 else {
+                return (false, "Could not determine downloaded file size")
+            }
+            if fileSize != expectedSize {
+                return (false, "Integrity check failed: file size mismatch (expected \(expectedSize) bytes, got \(fileSize) bytes)")
+            }
+            let computedSHA = try computeSHA256(of: url)
+            if computedSHA.lowercased() != expectedSHA256.lowercased() {
+                return (false, "Integrity check failed: SHA-256 checksum mismatch (expected \(expectedSHA256), got \(computedSHA))")
+            }
+            return (true, nil)
+        } catch {
+            return (false, "Integrity check failed: \(error.localizedDescription)")
+        }
+    }
+    
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let filename = taskToFilename[downloadTask.taskIdentifier] else { return }
         let destinationURL = AudioTranscriber.xdgModelsDirectory.appendingPathComponent(filename)
+        
+        // Issue 11: Validate file size and SHA-256 before moving to models directory
+        if let modelInfo = AudioTranscriber.knownModels.first(where: { $0.filename == filename }) {
+            let verification = Self.verifyFileIntegrity(
+                at: location,
+                expectedSize: modelInfo.expectedSizeBytes,
+                expectedSHA256: modelInfo.sha256
+            )
+            
+            if !verification.isValid {
+                try? FileManager.default.removeItem(at: location)
+                let errorMsg = verification.error ?? "Downloaded model failed integrity check"
+                print("❌ [ModelDownloadManager] \(errorMsg)")
+                DispatchQueue.main.async {
+                    self.lastError = errorMsg
+                    self.activeDownloads.remove(filename)
+                    self.downloadProgress.removeValue(forKey: filename)
+                    self.activeTasks.removeValue(forKey: filename)
+                    self.taskToFilename.removeValue(forKey: downloadTask.taskIdentifier)
+                }
+                return
+            }
+        }
         
         do {
             if FileManager.default.fileExists(atPath: destinationURL.path) {
@@ -104,6 +164,8 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
                 self.lastError = "Failed to save model: \(error.localizedDescription)"
                 self.activeDownloads.remove(filename)
                 self.downloadProgress.removeValue(forKey: filename)
+                self.activeTasks.removeValue(forKey: filename)
+                self.taskToFilename.removeValue(forKey: downloadTask.taskIdentifier)
             }
         }
     }

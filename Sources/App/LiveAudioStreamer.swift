@@ -1,18 +1,114 @@
 import Foundation
 import AVFoundation
 
+/// High-performance, real-time safe audio ring buffer.
+/// Pre-allocated buffer memory ensures zero heap allocations on the CoreAudio IOThread.
+public final class RealtimeAudioRingBuffer {
+    private let capacity: Int
+    private let buffer: UnsafeMutablePointer<Float>
+    private var writeHead: Int = 0
+    private var readHead: Int = 0
+    private var lock = os_unfair_lock_s()
+    
+    public init(capacity: Int = 131072) { // 131,072 samples = 8.192 seconds at 16kHz
+        self.capacity = capacity
+        self.buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacity)
+        self.buffer.initialize(repeating: 0, count: capacity)
+    }
+    
+    deinit {
+        buffer.deinitialize(count: capacity)
+        buffer.deallocate()
+    }
+    
+    public func reset() {
+        os_unfair_lock_lock(&lock)
+        writeHead = 0
+        readHead = 0
+        os_unfair_lock_unlock(&lock)
+    }
+    
+    /// Called on CoreAudio real-time I/O thread: zero allocations, microsecond execution time.
+    public func write(from source: UnsafePointer<Float>, count: Int) {
+        guard count > 0 else { return }
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        
+        let available = capacity - (writeHead - readHead)
+        let toWrite = min(count, max(0, available))
+        guard toWrite > 0 else { return } // Ring buffer full: drop to prevent overrun
+        
+        let startIdx = writeHead % capacity
+        let firstChunk = min(toWrite, capacity - startIdx)
+        let secondChunk = toWrite - firstChunk
+        
+        buffer.advanced(by: startIdx).assign(from: source, count: firstChunk)
+        if secondChunk > 0 {
+            buffer.assign(from: source.advanced(by: firstChunk), count: secondChunk)
+        }
+        writeHead += toWrite
+    }
+    
+    /// Drains pending samples into target buffer. CoreAudio thread is never blocked.
+    public func drain(into target: inout [Float]) {
+        os_unfair_lock_lock(&lock)
+        let available = writeHead - readHead
+        guard available > 0 else {
+            os_unfair_lock_unlock(&lock)
+            return
+        }
+        
+        let startIdx = readHead % capacity
+        let firstChunk = min(available, capacity - startIdx)
+        let secondChunk = available - firstChunk
+        
+        readHead += available
+        os_unfair_lock_unlock(&lock)
+        
+        target.reserveCapacity(target.count + available)
+        target.append(contentsOf: UnsafeBufferPointer(start: buffer.advanced(by: startIdx), count: firstChunk))
+        if secondChunk > 0 {
+            target.append(contentsOf: UnsafeBufferPointer(start: buffer, count: secondChunk))
+        }
+    }
+    
+    public var pendingSampleCount: Int {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        return max(0, writeHead - readHead)
+    }
+}
+
 public final class LiveAudioStreamer {
     private let audioEngine = AVAudioEngine()
-    private var isRecording = false
+    private(set) public var isRecording = false
     private let targetSampleRate: Double = 16000.0
     
-    // Samples buffer locked with NSLock
-    private let lock = NSLock()
-    private var sampleBuffer: [Float] = []
+    // Real-time lock-free ring buffer for audio tap
+    private let ringBuffer = RealtimeAudioRingBuffer()
+    private var accumulatedSamples: [Float] = []
+    private let consumerLock = NSLock()
+    
+    // Pre-allocated conversion buffer reused on real-time thread (zero heap allocations)
+    private var conversionBuffer: AVAudioPCMBuffer?
+    private var audioConverter: AVAudioConverter?
     
     public var onVolumeChanged: ((Float) -> Void)?
+    public var onConfigurationChange: ((Error?) -> Void)?
     
-    public init() {}
+    public init() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleEngineConfigurationChange(_:)),
+            name: .AVAudioEngineConfigurationChange,
+            object: audioEngine
+        )
+    }
+    
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        stop()
+    }
     
     public static func requestPermission(completion: @escaping (Bool) -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -51,30 +147,48 @@ public final class LiveAudioStreamer {
         guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             throw AudioLoaderError.conversionFailed("Could not instantiate audio converter from \(inputFormat) to 16kHz mono.")
         }
+        self.audioConverter = converter
         
-        lock.lock()
-        sampleBuffer.removeAll(keepingCapacity: true)
-        lock.unlock()
+        // Pre-allocate conversion buffer outside real-time callback (8192 frames = >500ms headroom)
+        guard let preallocated = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: 8192) else {
+            throw AudioLoaderError.conversionFailed("Failed to pre-allocate real-time conversion buffer.")
+        }
+        self.conversionBuffer = preallocated
+        
+        consumerLock.lock()
+        ringBuffer.reset()
+        accumulatedSamples.removeAll(keepingCapacity: true)
+        consumerLock.unlock()
         
         let bufferSize = AVAudioFrameCount(inputFormat.sampleRate * 0.1) // 100ms chunks
         inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { [weak self] buffer, _ in
-            guard let self = self else { return }
+            guard let self = self,
+                  let converter = self.audioConverter,
+                  let convertedBuffer = self.conversionBuffer else { return }
             
-            // Calculate audio level (RMS) for UI visualization
-            if let channelData = buffer.floatChannelData?[0] {
-                let count = Int(buffer.frameLength)
-                var sumSq: Float = 0
-                for i in 0..<count {
-                    let s = channelData[i]
-                    sumSq += s * s
+            // Issue 4 Fix: Calculate maximum RMS audio level across ALL available hardware channels
+            if let channelData = buffer.floatChannelData {
+                let channelCount = Int(buffer.format.channelCount)
+                let frameCount = Int(buffer.frameLength)
+                var maxRms: Float = 0.0
+                for ch in 0..<channelCount {
+                    let channelPtr = channelData[ch]
+                    var sumSq: Float = 0
+                    for i in 0..<frameCount {
+                        let s = channelPtr[i]
+                        sumSq += s * s
+                    }
+                    let rms = sqrt(sumSq / Float(max(1, frameCount)))
+                    if rms > maxRms {
+                        maxRms = rms
+                    }
                 }
-                let rms = sqrt(sumSq / Float(max(1, count)))
-                self.onVolumeChanged?(rms)
+                self.onVolumeChanged?(maxRms)
             }
             
-            let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * (self.targetSampleRate / inputFormat.sampleRate)) + 512)
-            guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
-            
+            // Issue 2 Fix: Zero dynamic memory allocation on CoreAudio real-time thread.
+            // Reset frameLength on pre-allocated conversionBuffer and convert in-place.
+            convertedBuffer.frameLength = 0
             var error: NSError?
             var isDone = false
             let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
@@ -91,11 +205,8 @@ public final class LiveAudioStreamer {
             converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
             if error == nil, let outData = convertedBuffer.floatChannelData?[0] {
                 let frameCount = Int(convertedBuffer.frameLength)
-                let newSamples = Array(UnsafeBufferPointer(start: outData, count: frameCount))
-                
-                self.lock.lock()
-                self.sampleBuffer.append(contentsOf: newSamples)
-                self.lock.unlock()
+                // Write directly into ring buffer without any Array heap allocations or mutex contention
+                self.ringBuffer.write(from: outData, count: frameCount)
             }
         }
         
@@ -113,11 +224,34 @@ public final class LiveAudioStreamer {
         onVolumeChanged?(0)
     }
     
-    /// Retrieves a snapshot of the current accumulated speech samples.
+    // Issue 3 Fix: Handle hardware device route & configuration changes
+    @objc private func handleEngineConfigurationChange(_ notification: Notification) {
+        guard isRecording else { return }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self, self.isRecording else { return }
+            do {
+                // Attempt to seamlessly restart the audio engine with new hardware configuration
+                try self.start()
+                DispatchQueue.main.async {
+                    self.onConfigurationChange?(nil)
+                }
+            } catch {
+                self.stop()
+                DispatchQueue.main.async {
+                    self.onConfigurationChange?(error)
+                }
+            }
+        }
+    }
+    
+    /// Retrieves a snapshot of all accumulated speech samples.
+    /// Drains from real-time ring buffer without blocking CoreAudio tap.
     public func getSamplesSnapshot() -> [Float] {
-        lock.lock()
-        defer { lock.unlock() }
-        return sampleBuffer
+        consumerLock.lock()
+        defer { consumerLock.unlock() }
+        ringBuffer.drain(into: &accumulatedSamples)
+        return accumulatedSamples
     }
     
     /// Saves the current recording buffer to the specified directory

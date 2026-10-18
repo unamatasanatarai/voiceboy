@@ -57,33 +57,40 @@ public struct MinimalMainView: View {
                 
                 // 4. Pinned Footer anchored at the bottom
                 VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     // Dock icon toggle on the left
                     Toggle("Dock icon", isOn: $appState.showDockIcon)
                         .toggleStyle(PillToggleStyle())
                     
-                    // Folder selection moved to the left next to Dock icon (removed "Folder:" label)
-                    HStack(spacing: 5) {
-                        Button(action: {
-                            appState.changeRecordingsDirectory()
-                        }) {
-                            Text(abbreviatedPath(appState.recordingsDirectory.path))
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundColor(MinimalMainView.textGray)
-                                .lineLimit(1)
+                    // Save audio toggle (Issue 10)
+                    Toggle("Save audio", isOn: $appState.saveRecordingsToDisk)
+                        .toggleStyle(PillToggleStyle())
+                        .help("Save WAV recordings to disk")
+                    
+                    if appState.saveRecordingsToDisk {
+                        // Folder selection next to Save audio
+                        HStack(spacing: 5) {
+                            Button(action: {
+                                appState.changeRecordingsDirectory()
+                            }) {
+                                Text(abbreviatedPath(appState.recordingsDirectory.path))
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(MinimalMainView.textGray)
+                                    .lineLimit(1)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Click to change directory")
+                            
+                            Button(action: {
+                                appState.openRecordingsDirectory()
+                            }) {
+                                Image(systemName: "arrow.up.right.square")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(MinimalMainView.textGray)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open in Finder")
                         }
-                        .buttonStyle(.plain)
-                        .help("Click to change directory")
-                        
-                        Button(action: {
-                            appState.openRecordingsDirectory()
-                        }) {
-                            Image(systemName: "arrow.up.right.square")
-                                .font(.system(size: 11))
-                                .foregroundColor(MinimalMainView.textGray)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Open in Finder")
                     }
                     
                     Spacer()

@@ -2,9 +2,31 @@ import Cocoa
 import ApplicationServices
 
 public final class TextPaster {
+    private static var lastPasteTimestamp: TimeInterval = 0
+    private static var lastPastedText: String = ""
+    private static let lock = NSLock()
+    
+    public static func resetDebounceForTesting() {
+        lock.lock()
+        lastPasteTimestamp = 0
+        lastPastedText = ""
+        lock.unlock()
+    }
+    
     public static func paste(text: String, copyToClipboard: Bool = AppState.shared.copyToClipboard) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        
+        // Debounce protection: prevent duplicate paste calls within a 300ms window
+        lock.lock()
+        let now = Date().timeIntervalSince1970
+        if trimmed == lastPastedText && (now - lastPasteTimestamp) < 0.3 {
+            lock.unlock()
+            return
+        }
+        lastPasteTimestamp = now
+        lastPastedText = trimmed
+        lock.unlock()
         
         // 1. Prepare pasteboard
         let pasteboard = NSPasteboard.general
@@ -55,52 +77,54 @@ public final class TextPaster {
         }
     }
     
+    // MARK: - Modifier Key Management (Issue 12)
+    /// Virtual key codes for all macOS modifier keys (Left/Right Option, Shift, Control, Command)
+    public static let allModifierKeyCodes: [CGKeyCode] = [
+        58, 61, // Option (Left, Right)
+        56, 60, // Shift (Left, Right)
+        59, 62, // Control (Left, Right)
+        55, 54  // Command (Left, Right)
+    ]
+    
+    /// Synthesizes key-up events for all modifier keys to prevent hotkey modifiers (e.g. ⇧⌥K or ⌃⌥Space)
+    /// from corrupting the subsequent ⌘V keystroke into ⇧⌘V or ⌃⌘V.
+    public static func releaseAllModifiers(source: CGEventSource?) {
+        for keyCode in allModifierKeyCodes {
+            if let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) {
+                keyUp.flags = []
+                keyUp.post(tap: .cghidEventTap)
+            }
+        }
+    }
+    
     public static func simulatePaste() {
         let src = CGEventSource(stateID: .combinedSessionState)
         
-        // Virtual key codes:
-        // Left Option: 58 (0x3A), Right Option: 61 (0x3D)
-        // Command: 55 (0x37)
-        // 'v': 9 (0x09)
+        // Step 1: Release all physical modifier keys in case any are still held from hotkey triggers
+        releaseAllModifiers(source: src)
         
-        // Step 1: Release physical Option/Alt keys in case still held from hotkey press (⌥[)
-        if let optUpLeft = CGEvent(keyboardEventSource: src, virtualKey: 58, keyDown: false) {
-            optUpLeft.flags = []
-            optUpLeft.post(tap: .cghidEventTap)
-            optUpLeft.post(tap: .cgAnnotatedSessionEventTap)
-        }
-        if let optUpRight = CGEvent(keyboardEventSource: src, virtualKey: 61, keyDown: false) {
-            optUpRight.flags = []
-            optUpRight.post(tap: .cghidEventTap)
-            optUpRight.post(tap: .cgAnnotatedSessionEventTap)
-        }
-        
-        // Step 2: Post Command DOWN
+        // Step 2: Post Command DOWN with strict .maskCommand
         if let cmdDown = CGEvent(keyboardEventSource: src, virtualKey: 55, keyDown: true) {
             cmdDown.flags = .maskCommand
             cmdDown.post(tap: .cghidEventTap)
-            cmdDown.post(tap: .cgAnnotatedSessionEventTap)
         }
         
-        // Step 3: Post 'v' DOWN with Command flag
+        // Step 3: Post 'v' DOWN with strict .maskCommand
         if let vDown = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: true) {
             vDown.flags = .maskCommand
             vDown.post(tap: .cghidEventTap)
-            vDown.post(tap: .cgAnnotatedSessionEventTap)
         }
         
-        // Step 4: Post 'v' UP with Command flag
+        // Step 4: Post 'v' UP with strict .maskCommand
         if let vUp = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: false) {
             vUp.flags = .maskCommand
             vUp.post(tap: .cghidEventTap)
-            vUp.post(tap: .cgAnnotatedSessionEventTap)
         }
         
         // Step 5: Post Command UP with empty flags
         if let cmdUp = CGEvent(keyboardEventSource: src, virtualKey: 55, keyDown: false) {
             cmdUp.flags = []
             cmdUp.post(tap: .cghidEventTap)
-            cmdUp.post(tap: .cgAnnotatedSessionEventTap)
         }
     }
 }

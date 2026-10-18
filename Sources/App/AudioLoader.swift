@@ -168,4 +168,32 @@ public final class AudioLoader {
         let duration = Double(slice.count) / Double(sampleRate)
         return (slice, duration)
     }
+    
+    /// Locates an optimal natural pause / silence split point (RMS < threshold) within the given search range.
+    public static func findSilenceSplitPoint(samples: [Float],
+                                             sampleRate: Int = 16000,
+                                             searchStart: Int,
+                                             searchEnd: Int,
+                                             threshold: Float = 0.012) -> Int? {
+        guard searchStart >= 0, searchEnd <= samples.count, searchStart < searchEnd else { return nil }
+        let windowSize = sampleRate / 20 // 50ms window
+        var bestIndex: Int? = nil
+        var lowestRms: Float = Float.greatestFiniteMagnitude
+        
+        var idx = searchStart
+        while idx + windowSize <= searchEnd {
+            var sumSq: Float = 0.0
+            for j in 0..<windowSize {
+                let v = samples[idx + j]
+                sumSq += v * v
+            }
+            let rms = sqrt(sumSq / Float(windowSize))
+            if rms < threshold && rms < lowestRms {
+                lowestRms = rms
+                bestIndex = idx + windowSize / 2
+            }
+            idx += windowSize
+        }
+        return bestIndex
+    }
 }

@@ -51,19 +51,44 @@ else
     exit 1
 fi
 
-# Optional audio file transcription if present
-if [[ -f "input.m4a" ]]; then
-    printf '%s\n' ""
-    printf '%s\n' "==> [Audio Test] Transcribing input.m4a (Native AAC -> 16kHz PCM)..."
-    out_m4a="$("$cli_bin" input.m4a --model futo-english-39.bin)"
-    echo "$out_m4a"
-    if echo "$out_m4a" | grep -qi "movie"; then
-        printf '%s\n' "✅ [Audio Test PASSED] Successfully decoded and transcribed input.m4a!"
-    else
-        printf '%s\n' "❌ [Audio Test FAILED] Transcription for input.m4a did not match." >&2
-        exit 1
+# Test 4: Native Swift unit & adversarial test suite
+printf '%s\n' ""
+printf '%s\n' "==> [Test 4] Compiling and running native Swift test suite..."
+test_sources=()
+while IFS= read -r file; do
+    if [[ "$file" != "Sources/App/Main.swift" ]]; then
+        test_sources+=("$file")
     fi
-fi
+done < <(find Sources/App -type f -name "*.swift" | sort)
+test_sources+=("Tests/VoiceBoyTests.swift")
+
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/${APP_NAME,,}"
+sdk_file="${cache_dir}/sdk_path.tmp"
+xcrun --show-sdk-path >"$sdk_file" 2>/dev/null
+IFS= read -r sdk_path <"$sdk_file"
+rm -f "$sdk_file"
+
+whisper_lib="${project_dir}/deps/whisper.cpp/build-static/libwhisper_all.a"
+
+swiftc -sdk "$sdk_path" \
+    -O \
+    -whole-module-optimization \
+    -import-objc-header Sources/BridgingHeader.h \
+    -I deps/whisper.cpp/include \
+    -I deps/whisper.cpp/ggml/include \
+    -Xlinker "$whisper_lib" \
+    -lc++ \
+    -framework Accelerate \
+    -framework Metal \
+    -framework MetalKit \
+    -framework Foundation \
+    -framework AVFoundation \
+    -framework Cocoa \
+    -framework Carbon \
+    "${test_sources[@]}" \
+    -o "build/VoiceBoyTests"
+
+./build/VoiceBoyTests
 
 printf '%s\n' ""
 printf '%s\n' "🎉 All tests passed successfully!"

@@ -179,6 +179,7 @@ public final class LiveAudioStreamer {
         consumerLock.unlock()
         
         let bufferSize = AVAudioFrameCount(inputFormat.sampleRate * 0.1) // 100ms chunks
+        inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { [weak self] buffer, _ in
             guard let self = self,
                   let converter = self.audioConverter,
@@ -234,10 +235,12 @@ public final class LiveAudioStreamer {
     }
     
     public func stop() {
+        // ALWAYS remove tap first unconditionally to prevent "nullptr == Tap()" exceptions on subsequent start()
+        audioEngine.inputNode.removeTap(onBus: 0)
         if audioEngine.isRunning {
             audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
         }
+        audioEngine.reset()
         isRecording = false
         onVolumeChanged?(0)
     }
@@ -246,19 +249,16 @@ public final class LiveAudioStreamer {
     @objc private func handleEngineConfigurationChange(_ notification: Notification) {
         guard isRecording else { return }
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // Serialize configuration restarts on the main queue to prevent concurrent start/stop races
+        DispatchQueue.main.async { [weak self] in
             guard let self = self, self.isRecording else { return }
             do {
                 // Attempt to seamlessly restart the audio engine with new hardware configuration
                 try self.start()
-                DispatchQueue.main.async {
-                    self.onConfigurationChange?(nil)
-                }
+                self.onConfigurationChange?(nil)
             } catch {
                 self.stop()
-                DispatchQueue.main.async {
-                    self.onConfigurationChange?(error)
-                }
+                self.onConfigurationChange?(error)
             }
         }
     }

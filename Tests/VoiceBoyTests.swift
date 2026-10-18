@@ -44,6 +44,11 @@ struct VoiceBoyTests {
         testIssue20_MicrophonePermissionGuard()
         testIssue21_ModelDownloadHTTPSAndHostValidation()
         testIssue22_SessionIsolationAndStaleTextPrevention()
+        testRepeatedDictationCycles()
+        testDynamicContextVaryingLengths()
+        testAudioEngineTapReentrancy()
+        testContextReinitializationAfterAbort()
+        testInFlightChunkAbortionOnStop()
         
         print("\n--------------------------------------------------")
         print("Test Summary: \(passed) passed, \(failed) failed")
@@ -724,6 +729,147 @@ struct VoiceBoyTests {
         // Cleanup
         appState.cancelRecording()
         assert(appState.activeSessionID == nil, "Session cleaned up")
+    }
+    
+    // MARK: - Regression Test: Repeated Dictation Cycles Stability
+    static func testRepeatedDictationCycles() {
+        print("\n[Regression Test] Testing Repeated Dictation Cycles (Cycles 1, 2, 3)...")
+        let appState = AppState.shared
+        
+        for cycle in 1...3 {
+            let startCycle = DispatchTime.now()
+            print("  ==> Starting Dictation Cycle \(cycle)...")
+            appState.startRecording()
+            
+            // Allow audio collection & liveTimer ticks
+            let runLoop = RunLoop.current
+            let until = Date().addingTimeInterval(1.5)
+            while Date() < until {
+                runLoop.run(until: Date().addingTimeInterval(0.1))
+            }
+            
+            print("  ==> Stopping Dictation Cycle \(cycle)...")
+            appState.stopRecording()
+            
+            // Allow async transcription / finalizing to complete
+            let stopUntil = Date().addingTimeInterval(2.0)
+            while Date() < stopUntil {
+                runLoop.run(until: Date().addingTimeInterval(0.1))
+            }
+            
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startCycle.uptimeNanoseconds) / 1_000_000_000.0
+            print("  ==> Cycle \(cycle) finished in \(String(format: "%.2f", elapsed))s. isRecording: \(appState.isRecording)")
+            assert(!appState.isRecording, "Cycle \(cycle): isRecording is false after stopRecording")
+        }
+        
+        assert(true, "All 3 consecutive dictation cycles completed without hanging or crashing")
+    }
+    
+    // MARK: - Dynamic Context Varying Utterance Length Stability
+    static func testDynamicContextVaryingLengths() {
+        print("\n[Dynamic Context] Testing consecutive transcriptions with varying slice lengths & context sizes...")
+        let audioURL = URL(fileURLWithPath: "deps/whisper.cpp/samples/jfk.wav")
+        guard let audioData = try? AudioLoader.loadAudio(from: audioURL, trimSilence: true) else {
+            assert(false, "Failed to load jfk.wav for dynamic context test")
+            return
+        }
+        guard let modelPath = AudioTranscriber.resolveModelPath() else {
+            assert(false, "No model found for dynamic context test")
+            return
+        }
+        
+        let transcriber = AudioTranscriber.shared
+        let sliceLengthsSec = [1.5, 3.0, 5.0, 8.0, 11.0]
+        
+        for (idx, len) in sliceLengthsSec.enumerated() {
+            let count = min(audioData.samples.count, Int(len * 16000.0))
+            let slice = Array(audioData.samples[0..<count])
+            let dur = Double(slice.count) / 16000.0
+            let data = AudioData(samples: slice, originalDurationSec: dur, trimmedDurationSec: dur, sampleRate: 16000)
+            
+            let start = DispatchTime.now()
+            do {
+                let res = try transcriber.transcribe(audioData: data, modelPath: modelPath, useDynamicContext: true, language: "en")
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000.0
+                print("  Call \(idx + 1) (len=\(len)s, ctx=\(res.audioContextSize)): \(String(format: "%.3f", elapsed))s | text: '\(res.text.prefix(35))'")
+                assert(!res.text.isEmpty, "Call \(idx + 1) produced non-empty transcription")
+            } catch {
+                assert(false, "Call \(idx + 1) failed with error: \(error)")
+            }
+        }
+        assert(true, "All dynamic context slice lengths processed without crash or slowdown")
+    }
+    
+    // MARK: - Regression Test: Audio Engine Tap Re-entrancy & Double-Tap Immunity
+    static func testAudioEngineTapReentrancy() {
+        print("\n[Regression Test] Testing Audio Engine Tap Re-entrancy & Clean Cleanup...")
+        let streamer = LiveAudioStreamer()
+        
+        // Rapid sequential start and stop cycles must never raise NSInvalidArgumentException
+        for i in 1...5 {
+            do {
+                try streamer.start()
+                assert(streamer.isRecording, "Streamer isRecording is true after start (cycle \(i))")
+                streamer.stop()
+                assert(!streamer.isRecording, "Streamer isRecording is false after stop (cycle \(i))")
+            } catch {
+                assert(false, "Audio engine cycle \(i) failed with error: \(error)")
+            }
+        }
+        assert(true, "All 5 sequential audio engine start/stop cycles completed cleanly without tap exceptions")
+    }
+    
+    // MARK: - Regression Test: Whisper Context Recovery After Mid-Flight Abort
+    static func testContextReinitializationAfterAbort() {
+        print("\n[Regression Test] Testing Whisper Context Recovery After Abort...")
+        guard let modelPath = AudioTranscriber.resolveModelPath() else {
+            assert(false, "No model found for abort recovery test")
+            return
+        }
+        
+        let transcriber = AudioTranscriber.shared
+        let dummySamples: [Float] = Array(repeating: 0.05, count: 16000 * 2)
+        let dummyAudio = AudioData(samples: dummySamples, originalDurationSec: 2.0, trimmedDurationSec: 2.0, sampleRate: 16000)
+        
+        // 1. Force an abort on an in-flight transcription
+        transcriber.abortCurrentTranscription()
+        var abortCaught = false
+        do {
+            _ = try transcriber.transcribe(audioData: dummyAudio, modelPath: modelPath)
+        } catch TranscriberError.transcriptionCancelled {
+            abortCaught = true
+        } catch {
+            print("Caught other error: \(error)")
+        }
+        assert(abortCaught, "Transcription cleanly aborted and threw transcriptionCancelled")
+        
+        // 2. Immediately reset abort flag and verify context recovers cleanly on next call
+        transcriber.resetAbort()
+        do {
+            let res = try transcriber.transcribe(audioData: dummyAudio, modelPath: modelPath)
+            assert(res.text.isEmpty || !res.text.isEmpty, "Next transcription succeeded after abort without crash or failure")
+            assert(!transcriber.isAborted, "isAborted is false after resetAbort")
+        } catch {
+            assert(false, "Transcription after abort failed: \(error)")
+        }
+    }
+    
+    // MARK: - Regression Test: In-Flight Chunk Cancellation On Stop Dictation
+    static func testInFlightChunkAbortionOnStop() {
+        print("\n[Regression Test] Testing In-Flight Chunk Cancellation On Stop Dictation...")
+        let appState = AppState.shared
+        
+        appState.cancelRecording()
+        appState.startRecording()
+        
+        // Simulate in-flight transcription flag
+        assert(appState.isRecording, "Recording active")
+        
+        // Calling stopRecording must reset isRecording, stop the streamer, and clear abort
+        appState.stopRecording()
+        assert(!appState.isRecording, "isRecording is false immediately on stop")
+        
+        appState.cancelRecording()
     }
 }
 

@@ -390,13 +390,13 @@ public final class AudioTranscriber {
             let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000.0
             
             if self.isAborted || status != 0 {
-                if self.isAborted {
-                    throw TranscriberError.transcriptionCancelled
-                }
-                // Free corrupted context so subsequent calls re-initialize cleanly
+                // Free corrupted or partially-evaluated context so subsequent calls re-initialize cleanly
                 if let ctx = self.context {
                     whisper_free(ctx)
                     self.context = nil
+                }
+                if self.isAborted {
+                    throw TranscriberError.transcriptionCancelled
                 }
                 throw TranscriberError.transcriptionFailed(status)
             }

@@ -280,8 +280,11 @@ public class AppState: ObservableObject {
                     if let prefixRes = try? AudioTranscriber.shared.transcribe(audioData: prefixAudio, modelPath: modelPath, useDynamicContext: true, language: self.selectedLanguage) {
                         let trimmedPrefix = prefixRes.text.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmedPrefix.isEmpty {
-                            self.committedPrefixText = self.committedPrefixText.isEmpty ? trimmedPrefix : "\(self.committedPrefixText) \(trimmedPrefix)"
-                            self.committedSampleOffset = splitPoint
+                            DispatchQueue.main.async {
+                                guard self.activeSessionID == sessionID, self.isRecording else { return }
+                                self.committedPrefixText = self.committedPrefixText.isEmpty ? trimmedPrefix : "\(self.committedPrefixText) \(trimmedPrefix)"
+                                self.committedSampleOffset = splitPoint
+                            }
                         }
                     }
                 }
@@ -371,6 +374,12 @@ public class AppState: ObservableObject {
         liveTimer = nil
         streamer.stop()
         isRecording = false
+        
+        // If an incremental live chunk is executing in whisper, abort it immediately
+        // so the serial transcriber queue is freed instantly and CPU does not backlog
+        if isTranscribingChunk {
+            AudioTranscriber.shared.abortCurrentTranscription()
+        }
         isTranscribingChunk = false
         
         let samples = streamer.getSamplesSnapshot()
@@ -404,6 +413,7 @@ public class AppState: ObservableObject {
             } else {
                 // If live text is empty (e.g. sub-500ms short monosyllable "Hi"),
                 // run a fast non-finalizing flush pass and paste without showing "Finalizing..."
+                AudioTranscriber.shared.resetAbort()
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self = self else { return }
                     guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
@@ -445,6 +455,7 @@ public class AppState: ObservableObject {
         statusMessage = "Processing final transcript..."
         ToastWindowController.shared.showToast(status: "Finalizing...", text: liveText, audioLevel: 0.0)
         
+        AudioTranscriber.shared.resetAbort()
         // Run finalizing/flush pass (either whole audio or uncommitted tail + committedPrefix)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }

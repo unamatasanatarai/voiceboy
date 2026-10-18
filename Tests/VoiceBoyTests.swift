@@ -259,11 +259,12 @@ struct VoiceBoyTests {
             exp.leave()
         }
         
-        // Wait 15ms so whisper_full enters computation, then trigger native abort
-        usleep(15000)
+        // Wait 25ms so whisper_full enters computation, then trigger native abort
+        usleep(25000)
         transcriber.abortCurrentTranscription()
         
-        _ = exp.wait(timeout: .now() + 5.0)
+        let waitRes = exp.wait(timeout: .now() + 10.0)
+        assert(waitRes == .success, "Aborted inference returned within timeout")
         assert(inFlightCancelled, "In-flight transcription was cleanly aborted via ggml_abort_callback")
         transcriber.resetAbort()
     }

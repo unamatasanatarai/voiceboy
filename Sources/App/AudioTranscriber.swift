@@ -85,14 +85,18 @@ public final class AudioTranscriber {
     private var currentModelPath: String?
     private let queue = DispatchQueue(label: "org.futo.voiceboy.transcriber", qos: .userInitiated)
     
-    // Issue 5 Fix: Atomic abort flag for native ggml_abort_callback
-    private var abortFlag: Int32 = 0
+    // Issue 5 Fix: Pinned heap pointer for native ggml_abort_callback, immune to Swift exclusivity and copy-in/out
+    private let abortFlagPtr: UnsafeMutablePointer<Int32>
     
     public static let shared = AudioTranscriber()
     
-    public init() {}
+    public init() {
+        abortFlagPtr = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        abortFlagPtr.initialize(to: 0)
+    }
     
     deinit {
+        abortFlagPtr.deallocate()
         if let ctx = context {
             whisper_free(ctx)
         }
@@ -100,12 +104,16 @@ public final class AudioTranscriber {
     
     /// Requests immediate cancellation of any active in-flight whisper_full inference call.
     public func abortCurrentTranscription() {
-        abortFlag = 1
+        abortFlagPtr.pointee = 1
     }
     
     /// Clears any pending cancellation request before starting a new dictation session.
     public func resetAbort() {
-        abortFlag = 0
+        abortFlagPtr.pointee = 0
+    }
+    
+    public var isAborted: Bool {
+        return abortFlagPtr.pointee != 0
     }
     
     public struct ModelInfo: Identifiable, Hashable {
@@ -349,43 +357,40 @@ public final class AudioTranscriber {
             wparams.audio_ctx = targetCtx
             
             // Issue 5 Fix: Hook ggml_abort_callback to enable instant cancellation mid-inference
-            if self.abortFlag != 0 {
+            if self.isAborted {
                 throw TranscriberError.transcriptionCancelled
             }
             wparams.abort_callback = { userData in
                 guard let ptr = userData?.assumingMemoryBound(to: Int32.self) else { return false }
                 return ptr.pointee != 0
             }
+            wparams.abort_callback_user_data = UnsafeMutableRawPointer(self.abortFlagPtr)
             
             let resolvedLang: String? = (language.isEmpty || language.lowercased() == "auto") ? nil : language
             
             let start = DispatchTime.now()
             var status: Int32 = 0
             
-            withUnsafeMutablePointer(to: &self.abortFlag) { flagPtr in
-                wparams.abort_callback_user_data = UnsafeMutableRawPointer(flagPtr)
-                
-                if let lang = resolvedLang {
-                    status = lang.withCString { langPtr in
-                        wparams.language = langPtr
-                        return samples.withUnsafeBufferPointer { buf in
-                            whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
-                        }
+            if let lang = resolvedLang {
+                status = lang.withCString { langPtr in
+                    wparams.language = langPtr
+                    return samples.withUnsafeBufferPointer { buf in
+                        whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
                     }
-                } else {
-                    status = "auto".withCString { autoPtr in
-                        wparams.language = autoPtr
-                        return samples.withUnsafeBufferPointer { buf in
-                            whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
-                        }
+                }
+            } else {
+                status = "auto".withCString { autoPtr in
+                    wparams.language = autoPtr
+                    return samples.withUnsafeBufferPointer { buf in
+                        whisper_full(ctx, wparams, buf.baseAddress, Int32(buf.count))
                     }
                 }
             }
             
             let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000.0
             
-            if self.abortFlag != 0 || status != 0 {
-                if self.abortFlag != 0 {
+            if self.isAborted || status != 0 {
+                if self.isAborted {
                     throw TranscriberError.transcriptionCancelled
                 }
                 // Free corrupted context so subsequent calls re-initialize cleanly

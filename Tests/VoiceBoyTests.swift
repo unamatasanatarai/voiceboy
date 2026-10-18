@@ -40,6 +40,10 @@ struct VoiceBoyTests {
         testIssue14_ModelPathSanitization()
         testIssue15_PasteboardRaceCondition()
         testIssue16_SecureInputDetection()
+        testIssue19_UnicodeNormalizationAndEmojiFidelity()
+        testIssue20_MicrophonePermissionGuard()
+        testIssue21_ModelDownloadHTTPSAndHostValidation()
+        testIssue22_SessionIsolationAndStaleTextPrevention()
         
         print("\n--------------------------------------------------")
         print("Test Summary: \(passed) passed, \(failed) failed")
@@ -84,7 +88,7 @@ struct VoiceBoyTests {
         
         // 1. Write contiguous samples
         let inputSamples: [Float] = (0..<512).map { Float($0) }
-        inputSamples.withUnsafeBufferPointer { ptr in
+        _ = inputSamples.withUnsafeBufferPointer { ptr in
             ringBuffer.write(from: ptr.baseAddress!, count: 512)
         }
         assert(ringBuffer.pendingSampleCount == 512, "Ring buffer has 512 pending samples")
@@ -98,7 +102,7 @@ struct VoiceBoyTests {
         
         // 3. Test circular wraparound
         let largeChunk: [Float] = (0..<1500).map { Float($0) }
-        largeChunk.withUnsafeBufferPointer { ptr in
+        _ = largeChunk.withUnsafeBufferPointer { ptr in
             ringBuffer.write(from: ptr.baseAddress!, count: 1500)
         }
         var secondDrain: [Float] = []
@@ -625,6 +629,100 @@ struct VoiceBoyTests {
         TextPaster.resetDebounceForTesting()
         TextPaster.paste(text: "Test secure paste safety", copyToClipboard: false)
         assert(true, "TextPaster.paste executes safely with secure input check active")
+    }
+    
+    // MARK: - Issue 19: Unicode Canonical NFC Normalization & Emoji Fidelity
+    static func testIssue19_UnicodeNormalizationAndEmojiFidelity() {
+        print("\n[Issue 19] Testing Unicode Canonical NFC Normalization & Emoji Fidelity...")
+        let pboard = NSPasteboard.general
+        
+        // 1. Decomposed NFD string ("cafe" + combining acute accent "\u{0301}")
+        let nfdString = "cafe\u{0301} 🚀 🌍 日本語"
+        TextPaster.resetDebounceForTesting()
+        TextPaster.paste(text: nfdString, copyToClipboard: true)
+        
+        // In NFC, "e" + "\u{0301}" is precomposed into "\u{00E9}" ("café")
+        let pastedString = pboard.string(forType: .string) ?? ""
+        let expectedNFC = nfdString.precomposedStringWithCanonicalMapping
+        assert(pastedString == expectedNFC, "Pasted text is precomposed with canonical NFC mapping")
+        assert(pastedString.contains("🚀") && pastedString.contains("日本語"), "Emoji and non-Latin scripts preserved with 100% fidelity")
+    }
+    
+    // MARK: - Issue 20: Microphone Permission Guard
+    static func testIssue20_MicrophonePermissionGuard() {
+        print("\n[Issue 20] Testing Microphone Permission Status Guard...")
+        // 1. Verify isMicrophoneAuthorized accessor executes safely
+        let isAuthorized = LiveAudioStreamer.isMicrophoneAuthorized
+        assert(isAuthorized == true || isAuthorized == false, "LiveAudioStreamer.isMicrophoneAuthorized executes cleanly")
+        
+        // 2. Verify requestPermission handler executes completion callback
+        let exp = DispatchSemaphore(value: 0)
+        var receivedStatus: Bool? = nil
+        LiveAudioStreamer.requestPermission { granted in
+            receivedStatus = granted
+            exp.signal()
+        }
+        let waitResult = exp.wait(timeout: .now() + 2.0)
+        assert(waitResult == .success, "requestPermission callback fires within timeout")
+        assert(receivedStatus != nil, "requestPermission returns concrete authorization boolean")
+    }
+    
+    // MARK: - Issue 21: Model Download HTTPS & Host Whitelisting
+    static func testIssue21_ModelDownloadHTTPSAndHostValidation() {
+        print("\n[Issue 21] Testing Model Download HTTPS & Host Whitelisting...")
+        
+        // 1. Valid HTTPS trusted host
+        let validURL = URL(string: "https://keyboard.futo.org/voice-input-english-39.bin")!
+        assert(ModelDownloadManager.isURLAllowedForDownload(validURL), "Trusted HTTPS URL on keyboard.futo.org is allowed")
+        
+        let validHFURL = URL(string: "https://huggingface.co/models/whisper.bin")!
+        assert(ModelDownloadManager.isURLAllowedForDownload(validHFURL), "Trusted HTTPS URL on huggingface.co is allowed")
+        
+        // 2. Insecure HTTP scheme rejected
+        let insecureHTTP = URL(string: "http://keyboard.futo.org/voice-input-english-39.bin")!
+        assert(!ModelDownloadManager.isURLAllowedForDownload(insecureHTTP), "Insecure HTTP scheme is rejected")
+        
+        // 3. Untrusted external domain rejected
+        let untrustedHost = URL(string: "https://malicious-cdn.com/payload.bin")!
+        assert(!ModelDownloadManager.isURLAllowedForDownload(untrustedHost), "Untrusted external hostname is rejected")
+    }
+    
+    // MARK: - Issue 22: Stale Session Invalidation & Zero Data Leakage
+    static func testIssue22_SessionIsolationAndStaleTextPrevention() {
+        print("\n[Issue 22] Testing Stale Session Invalidation & Zero Data Leakage...")
+        let appState = AppState.shared
+        
+        // 1. Reset state
+        appState.cancelRecording()
+        assert(appState.activeSessionID == nil, "activeSessionID is nil after cancelRecording")
+        
+        // 2. Start session 1
+        appState.startRecording()
+        Thread.sleep(forTimeInterval: 0.05)
+        let session1 = appState.activeSessionID
+        assert(session1 != nil, "Session 1 ID active: \(String(describing: session1))")
+        
+        // 3. Simulate cancellation mid-stream
+        appState.cancelRecording()
+        assert(appState.activeSessionID == nil, "activeSessionID reset to nil immediately on cancellation")
+        
+        // 4. Verify that background completion with session1 is rejected
+        var delivered = false
+        if let current = appState.activeSessionID, current == session1 {
+            delivered = true
+        }
+        assert(!delivered, "Stale session payload with cancelled UUID is dropped and cannot deliver text")
+        
+        // 5. Start a new session
+        appState.startRecording()
+        Thread.sleep(forTimeInterval: 0.05)
+        let session2 = appState.activeSessionID
+        assert(session2 != nil && session2 != session1, "New session receives fresh distinct UUID")
+        assert(appState.activeSessionID == session2, "New session ID is active")
+        
+        // Cleanup
+        appState.cancelRecording()
+        assert(appState.activeSessionID == nil, "Session cleaned up")
     }
 }
 

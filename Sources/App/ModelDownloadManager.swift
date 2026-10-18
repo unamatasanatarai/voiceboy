@@ -43,8 +43,25 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
         return activeDownloads.contains(filename)
     }
     
+    // Issue 21: Allowed trusted model download hostnames and HTTPS validation
+    public static let allowedDownloadHosts: Set<String> = [
+        "keyboard.futo.org",
+        "futo.org",
+        "huggingface.co"
+    ]
+    
+    public static func isURLAllowedForDownload(_ url: URL) -> Bool {
+        guard url.scheme == "https" else { return false }
+        guard let host = url.host?.lowercased() else { return false }
+        return allowedDownloadHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+    }
+    
     public func startDownload(model: AudioTranscriber.ModelInfo) {
         guard let url = URL(string: model.downloadURL) else { return }
+        guard Self.isURLAllowedForDownload(url) else {
+            self.lastError = "Download rejected: URL must use HTTPS and point to a trusted model repository."
+            return
+        }
         guard !activeDownloads.contains(model.filename) else { return }
         
         lastError = nil

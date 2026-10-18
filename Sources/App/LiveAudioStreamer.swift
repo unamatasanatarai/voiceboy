@@ -135,8 +135,18 @@ public final class LiveAudioStreamer {
         }
     }
     
+    public static var isMicrophoneAuthorized: Bool {
+        return AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+    
     public func start() throws {
         stop()
+        
+        // Issue 20: Explicitly verify microphone authorization status before starting CoreAudio engine
+        let authStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        if authStatus == .denied || authStatus == .restricted {
+            throw AudioLoaderError.conversionFailed("Microphone access is denied or restricted.")
+        }
         
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.inputFormat(forBus: 0)

@@ -31,7 +31,8 @@ public final class TextPaster {
     }
     
     public static func paste(text: String, copyToClipboard: Bool = AppState.shared.copyToClipboard) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Issue 19: Canonical Unicode NFC normalization ensures combining marks, accented Latin, and emoji sequences render consistently
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
         guard !trimmed.isEmpty else { return }
         
         // Security check (Scenario 10): Block injection into password / secure-entry fields

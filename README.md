@@ -166,7 +166,7 @@ VoiceBoy persists your preferences via `UserDefaults`:
 
 ## Verification & Testing
 
-VoiceBoy includes an automated verification script that validates native CoreAudio ingestion, PCM decoding, and transcription inference against test recordings:
+VoiceBoy includes an automated test suite that validates binary execution, CLI options, model catalog resolution, and application bundle integrity:
 
 ```bash
 # Run the test suite
@@ -182,7 +182,7 @@ make test
 | `make build` | Compiles the `whisper.cpp` static library and native `VoiceBoy.app` bundle. |
 | `make run` | Terminates any running instance, recompiles, and launches `VoiceBoy.app`. |
 | `make kill` | Stops all active VoiceBoy processes. |
-| `make test` | Runs the verification test suite on WAV and M4A audio inputs. |
+| `make test` | Runs the automated verification test suite. |
 | `make dmg` | Packages the application into a styled macOS `.dmg` with custom background art. |
 | `make release <version>` | Bumps version, runs tests, creates styled DMG, and tags release. |
 | `make revoke` | Resets TCC permissions and clears macOS LaunchServices caches for clean testing. |

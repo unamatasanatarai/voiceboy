@@ -238,38 +238,83 @@ public final class AudioTranscriber {
     }
     
     /// Resolves the absolute path for a model file name or returns a standard fallback.
-    public static func resolveModelPath(named name: String = "futo-english-39.bin") -> String? {
-        let requestedCandidates = [name] + (name == "futo-english-39.bin" ? knownModels.map { $0.filename } : [])
+    public static func resolveModelPath(named name: String = "futo-english-39.bin", language: String? = nil) -> String? {
+        // Path traversal sanitization: reject attempts containing relative dots or invalid paths
+        let isPathTraversal = name.contains("..") || (name.contains("/") && !name.hasPrefix("/"))
+        if isPathTraversal {
+            return nil
+        }
         
-        for candidateName in requestedCandidates {
-            // Absolute path check
-            if candidateName.hasPrefix("/") && FileManager.default.fileExists(atPath: candidateName) {
-                return candidateName
+        // 1. Direct path or exact name lookup
+        if name.hasPrefix("/") && FileManager.default.fileExists(atPath: name) {
+            return name
+        }
+        
+        let safeName = URL(fileURLWithPath: name).lastPathComponent
+        if !safeName.isEmpty && safeName != "." && safeName != ".." {
+            if let found = findModelOnDisk(named: safeName) {
+                return found
             }
-            
-            // Path traversal sanitization (Section 9)
-            let safeName = URL(fileURLWithPath: candidateName).lastPathComponent
-            guard !safeName.isEmpty && safeName != "." && safeName != ".." else { continue }
-            
-            let candidates = [
-                // 1. XDG Models Directory (~/.local/share/voiceboy/models)
-                xdgModelsDirectory.appendingPathComponent(safeName).path,
-                // 2. Bundle Resources
-                Bundle.main.path(forResource: (safeName as NSString).deletingPathExtension, ofType: (safeName as NSString).pathExtension),
-                Bundle.main.resourceURL?.appendingPathComponent(safeName).path,
-                Bundle.main.resourceURL?.appendingPathComponent("models/\(safeName)").path,
-                // 3. Fallback for CLI development in repo
-                URL(fileURLWithPath: "models/\(safeName)").path,
-                URL(fileURLWithPath: safeName).path,
-                // 4. Relative to binary
-                Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("models/\(safeName)").path,
-                Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("../Resources/models/\(safeName)").path
-            ].compactMap { $0 }
-            
-            for candidate in candidates {
-                if FileManager.default.fileExists(atPath: candidate) {
-                    return candidate
+        }
+        
+        // 2. Intelligent fallback to available models if exact requested model is not downloaded
+        let isNonEnglish = (language != nil && !language!.isEmpty && language!.lowercased() != "en" && language!.lowercased() != "auto")
+        let fallbackOrder: [String]
+        if isNonEnglish {
+            fallbackOrder = [
+                "voice-input-multilingual-74.bin",
+                "voice-input-multilingual-244.bin",
+                "futo-english-39.bin",
+                "voice-input-english-74.bin"
+            ]
+        } else {
+            fallbackOrder = [
+                "futo-english-39.bin",
+                "voice-input-english-74.bin",
+                "voice-input-multilingual-74.bin",
+                "voice-input-english-244.bin",
+                "voice-input-multilingual-244.bin"
+            ]
+        }
+        
+        for candidate in fallbackOrder {
+            if let found = findModelOnDisk(named: candidate) {
+                return found
+            }
+        }
+        
+        // 3. Check for any valid .bin model in xdgModelsDirectory
+        if let contents = try? FileManager.default.contentsOfDirectory(atPath: xdgModelsDirectory.path) {
+            for file in contents.sorted() where file.hasSuffix(".bin") {
+                let fullPath = xdgModelsDirectory.appendingPathComponent(file).path
+                if FileManager.default.fileExists(atPath: fullPath) {
+                    return fullPath
                 }
+            }
+        }
+        
+        return nil
+    }
+    
+    private static func findModelOnDisk(named safeName: String) -> String? {
+        let candidates = [
+            // 1. XDG Models Directory (~/.local/share/voiceboy/models)
+            xdgModelsDirectory.appendingPathComponent(safeName).path,
+            // 2. Bundle Resources
+            Bundle.main.path(forResource: (safeName as NSString).deletingPathExtension, ofType: (safeName as NSString).pathExtension),
+            Bundle.main.resourceURL?.appendingPathComponent(safeName).path,
+            Bundle.main.resourceURL?.appendingPathComponent("models/\(safeName)").path,
+            // 3. Fallback for CLI development in repo
+            URL(fileURLWithPath: "models/\(safeName)").path,
+            URL(fileURLWithPath: safeName).path,
+            // 4. Relative to binary
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("models/\(safeName)").path,
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("../Resources/models/\(safeName)").path
+        ].compactMap { $0 }
+        
+        for candidate in candidates {
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
             }
         }
         return nil
@@ -299,6 +344,17 @@ public final class AudioTranscriber {
         self.currentModelPath = path
     }
     
+    /// Peak-normalizes quiet input so low-gain microphones produce usable log-mel features.
+    /// Gain is capped to avoid amplifying pure background noise into phantom speech.
+    static func normalizeGain(_ samples: [Float], targetPeak: Float = 0.9, maxGain: Float = 10.0) -> [Float] {
+        var peak: Float = 0
+        for s in samples { peak = max(peak, abs(s)) }
+        guard peak > 0 else { return samples }
+        let gain = min(maxGain, targetPeak / peak)
+        guard gain > 1.05 else { return samples }
+        return samples.map { $0 * gain }
+    }
+
     /// Transcribes audio samples using FUTO ACFT optimizations without translation.
     public func transcribe(audioData: AudioData,
                            modelPath: String? = nil,
@@ -323,15 +379,15 @@ public final class AudioTranscriber {
                 throw TranscriberError.contextInitializationFailed("No active context")
             }
             
-            let samples = audioData.samples
-            guard !samples.isEmpty else {
+            guard !audioData.samples.isEmpty else {
                 throw TranscriberError.emptyAudio
             }
+            let samples = AudioTranscriber.normalizeGain(audioData.samples)
             
             // Subsystem E: Bind thread count to physical cores on Intel to prevent hyperthreading cache thrashing
             let threads = Int32(min(8, max(1, AudioTranscriber.physicalCoreCount)))
             
-            let dur = audioData.trimmedDurationSec
+            let dur = Double(samples.count) / 16000.0
             let isLongAudio = dur > 30.0
             
             // Issue 6 Fix:
@@ -340,7 +396,9 @@ public final class AudioTranscriber {
             // enabling whisper.cpp standard multi-segment sliding window processing so trailing audio is not truncated.
             let targetCtx: Int32
             if useDynamicContext && !isLongAudio {
-                targetCtx = Int32(min(1500, max(64, Int(dur * 50.0))))
+                // Round up and add a safety margin: truncating to exactly dur*50 drops the final
+                // encoder frames, which clips the last word of the utterance.
+                targetCtx = Int32(min(1500, max(64, Int((dur * 50.0).rounded(.up)) + 32)))
             } else {
                 targetCtx = 0 // whisper.cpp default: standard 30s context window
             }
@@ -355,6 +413,8 @@ public final class AudioTranscriber {
             wparams.no_context = true
             wparams.single_segment = !isLongAudio
             wparams.audio_ctx = targetCtx
+            // Suppress non-speech tokens (♪, *, brackets, etc.) that show up as stray symbols
+            wparams.suppress_nst = true
             
             // Issue 5 Fix: Hook ggml_abort_callback to enable instant cancellation mid-inference
             if self.isAborted {
@@ -402,17 +462,24 @@ public final class AudioTranscriber {
             }
             
             let nSegments = whisper_full_n_segments(ctx)
-            var recognized = ""
+            // Concatenate raw bytes across segments before decoding so multi-byte UTF-8
+            // characters split across segment boundaries are reassembled correctly.
+            var recognizedBytes: [UInt8] = []
             for i in 0..<nSegments {
                 if let segPtr = whisper_full_get_segment_text(ctx, i) {
-                    recognized += String(cString: segPtr)
+                    recognizedBytes.append(contentsOf: UnsafeBufferPointer(start: UnsafeRawPointer(segPtr).assumingMemoryBound(to: UInt8.self), count: strlen(segPtr)))
                 }
             }
-            
-            // Issue 8 Fix: Strip [BLANK_AUDIO] artifacts and do NOT inject diagnostic messages
+            let recognized = String(decoding: recognizedBytes, as: UTF8.self)
+
+            // Issue 8 Fix: Strip [BLANK_AUDIO]-style annotations and do NOT inject diagnostic messages
             // into recognized output text. Silent audio returns empty text so it never pastes into apps.
+            // Also drop U+FFFD replacement chars left by incomplete UTF-8 sequences when decoding
+            // stops mid-character (shows up as garbage symbols at the end of the text).
             let cleanText = recognized
-                .replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
+                .replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "\u{FFFD}", with: "")
+                .replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             
             let isSilence = cleanText.isEmpty

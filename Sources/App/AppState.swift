@@ -7,7 +7,7 @@ public class AppState: ObservableObject {
     @Published public var isRecording: Bool = false
     @Published public var liveText: String = ""
     @Published public var lastTranscript: String = ""
-    @Published public var selectedModel: String = "voice-input-english-74.bin" {
+    @Published public var selectedModel: String = "futo-english-39.bin" {
         didSet {
             UserDefaults.standard.set(selectedModel, forKey: AppState.selectedModelDefaultsKey)
         }
@@ -15,6 +15,17 @@ public class AppState: ObservableObject {
     @Published public var selectedLanguage: String = "en" {
         didSet {
             UserDefaults.standard.set(selectedLanguage, forKey: AppState.selectedLanguageDefaultsKey)
+            if selectedLanguage == "pl" && selectedModel.contains("english") {
+                if ModelDownloadManager.shared.isModelDownloaded("voice-input-multilingual-74.bin") {
+                    selectedModel = "voice-input-multilingual-74.bin"
+                } else if ModelDownloadManager.shared.isModelDownloaded("voice-input-multilingual-244.bin") {
+                    selectedModel = "voice-input-multilingual-244.bin"
+                }
+            } else if selectedLanguage == "en" && selectedModel.contains("multilingual") {
+                if ModelDownloadManager.shared.isModelDownloaded("futo-english-39.bin") {
+                    selectedModel = "futo-english-39.bin"
+                }
+            }
         }
     }
     
@@ -119,16 +130,17 @@ public class AppState: ObservableObject {
             self.showDockIcon = false
         }
         
-        if let savedModel = UserDefaults.standard.string(forKey: AppState.selectedModelDefaultsKey) {
-            self.selectedModel = savedModel
+        let lang = UserDefaults.standard.string(forKey: AppState.selectedLanguageDefaultsKey) ?? "en"
+        self.selectedLanguage = lang
+        
+        let initialModel = UserDefaults.standard.string(forKey: AppState.selectedModelDefaultsKey) ?? (lang == "pl" ? "voice-input-multilingual-74.bin" : "futo-english-39.bin")
+        if let resolved = AudioTranscriber.resolveModelPath(named: initialModel, language: lang) {
+            let actualName = URL(fileURLWithPath: resolved).lastPathComponent
+            self.selectedModel = actualName
         } else {
-            self.selectedModel = "voice-input-english-74.bin"
+            self.selectedModel = initialModel
         }
-        if let savedLang = UserDefaults.standard.string(forKey: AppState.selectedLanguageDefaultsKey) {
-            self.selectedLanguage = savedLang
-        } else {
-            self.selectedLanguage = "en"
-        }
+        
         if UserDefaults.standard.object(forKey: AppState.copyToClipboardDefaultsKey) != nil {
             self.copyToClipboard = UserDefaults.standard.bool(forKey: AppState.copyToClipboardDefaultsKey)
         } else {
@@ -188,7 +200,21 @@ public class AppState: ObservableObject {
             guard let self = self else { return }
             guard granted else {
                 self.statusMessage = "Microphone access denied"
+                ToastWindowController.shared.showToast(status: "Microphone Access Denied", text: "Please enable microphone permission in System Settings.", audioLevel: 0.0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { ToastWindowController.shared.hideToast() }
                 return
+            }
+            
+            guard let resolvedModel = AudioTranscriber.resolveModelPath(named: self.selectedModel, language: self.selectedLanguage) else {
+                self.statusMessage = "No speech model found"
+                ToastWindowController.shared.showToast(status: "No speech model installed", text: "Open VoiceBoy settings to download a speech model.", audioLevel: 0.0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { ToastWindowController.shared.hideToast() }
+                return
+            }
+            
+            let actualModelName = URL(fileURLWithPath: resolvedModel).lastPathComponent
+            if self.selectedModel != actualModelName {
+                self.selectedModel = actualModelName
             }
             
             do {
@@ -259,11 +285,16 @@ public class AppState: ObservableObject {
         let totalCount = samples.count
         let uncommittedCount = totalCount - committedSampleOffset
         guard Double(uncommittedCount) / 16000.0 >= 0.5 else { return }
-        
+
+        // Track the active window start locally: the prefix commit below updates
+        // committedSampleOffset asynchronously on main, so reading it back here would
+        // re-transcribe (and duplicate) the just-committed prefix.
+        var activeStart = committedSampleOffset
+
         isTranscribingChunk = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
+            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel, language: self.selectedLanguage) else {
                 DispatchQueue.main.async { self.isTranscribingChunk = false }
                 return
             }
@@ -271,15 +302,16 @@ public class AppState: ObservableObject {
             // Issue 9: Sliding window & prefix stabilization ($O(1)$ computation per tick)
             // If active uncommitted audio exceeds ~6 seconds, find a natural pause and commit prefix
             if uncommittedCount >= 16000 * 6 {
-                let searchStart = self.committedSampleOffset + 16000 * 3
-                let searchEnd = self.committedSampleOffset + 16000 * 5
+                let searchStart = activeStart + 16000 * 3
+                let searchEnd = activeStart + 16000 * 5
                 if let splitPoint = AudioLoader.findSilenceSplitPoint(samples: samples, sampleRate: 16000, searchStart: searchStart, searchEnd: searchEnd) {
-                    let prefixSlice = Array(samples[self.committedSampleOffset..<splitPoint])
+                    let prefixSlice = Array(samples[activeStart..<splitPoint])
                     let prefixDur = Double(prefixSlice.count) / 16000.0
                     let prefixAudio = AudioData(samples: prefixSlice, originalDurationSec: prefixDur, trimmedDurationSec: prefixDur, sampleRate: 16000)
                     if let prefixRes = try? AudioTranscriber.shared.transcribe(audioData: prefixAudio, modelPath: modelPath, useDynamicContext: true, language: self.selectedLanguage) {
                         let trimmedPrefix = prefixRes.text.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmedPrefix.isEmpty {
+                            activeStart = splitPoint
                             DispatchQueue.main.async {
                                 guard self.activeSessionID == sessionID, self.isRecording else { return }
                                 self.committedPrefixText = self.committedPrefixText.isEmpty ? trimmedPrefix : "\(self.committedPrefixText) \(trimmedPrefix)"
@@ -291,7 +323,7 @@ public class AppState: ObservableObject {
             }
             
             // Transcribe active slice from committedSampleOffset to totalCount
-            let activeSlice = Array(samples[self.committedSampleOffset..<totalCount])
+            let activeSlice = Array(samples[activeStart..<totalCount])
             let dur = Double(activeSlice.count) / 16000.0
             let (trimmed, trimmedDur) = AudioLoader.stripLeadingAndTrailingSilence(samples: activeSlice, sampleRate: 16000)
             let audio = AudioData(
@@ -400,9 +432,12 @@ public class AppState: ObservableObject {
         let currentLive = liveText.trimmingCharacters(in: .whitespacesAndNewlines)
         
         // When Post-processing is OFF (!enableFinalizing):
-        // Instant paste mode: paste immediately with zero latency, never showing "Finalizing..."
+        // Paste the live transcript instantly only if it already covers all recorded audio.
+        // Otherwise the words spoken after the last live cycle would be dropped, so flush the
+        // uncommitted tail below (fast: at most a few seconds of audio) without the "Finalizing..." UI.
         if !enableFinalizing {
-            if !currentLive.isEmpty && currentLive != "[Silence / No speech detected]" {
+            let liveCoversAllAudio = samples.count - lastTranscribedSampleCount < 16000 / 10
+            if liveCoversAllAudio && !currentLive.isEmpty && currentLive != "[Silence / No speech detected]" {
                 self.activeSessionID = nil
                 self.lastTranscript = currentLive
                 self.statusMessage = "Pasted live transcript"
@@ -410,61 +445,25 @@ public class AppState: ObservableObject {
                     TextPaster.paste(text: currentLive, copyToClipboard: self.copyToClipboard)
                 }
                 return
-            } else {
-                // If live text is empty (e.g. sub-500ms short monosyllable "Hi"),
-                // run a fast non-finalizing flush pass and paste without showing "Finalizing..."
-                AudioTranscriber.shared.resetAbort()
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self = self else { return }
-                    guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
-                        DispatchQueue.main.async {
-                            guard self.activeSessionID == sessionID else { return }
-                            self.activeSessionID = nil
-                            ToastWindowController.shared.hideToast()
-                        }
-                        return
-                    }
-                    let dur = Double(samples.count) / 16000.0
-                    let audio = AudioData(samples: samples, originalDurationSec: dur, trimmedDurationSec: dur, sampleRate: 16000)
-                    if let result = try? AudioTranscriber.shared.transcribe(audioData: audio, modelPath: modelPath, useDynamicContext: true, language: self.selectedLanguage) {
-                        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        DispatchQueue.main.async {
-                            guard self.activeSessionID == sessionID else { return }
-                            self.activeSessionID = nil
-                            self.lastTranscript = text
-                            ToastWindowController.shared.hideToast {
-                                if !text.isEmpty && text != "[Silence / No speech detected]" {
-                                    TextPaster.paste(text: text, copyToClipboard: self.copyToClipboard)
-                                }
-                            }
-                        }
-                    } else {
-                        DispatchQueue.main.async {
-                            guard self.activeSessionID == sessionID else { return }
-                            self.activeSessionID = nil
-                            ToastWindowController.shared.hideToast()
-                        }
-                    }
-                }
-                return
             }
+        } else {
+            // When Post-processing is ON (enableFinalizing == true):
+            // Run full post-processing / finalizing pass for maximum accuracy:
+            statusMessage = "Processing final transcript..."
+            ToastWindowController.shared.showToast(status: "Finalizing...", text: liveText, audioLevel: 0.0)
         }
-        
-        // When Post-processing is ON (enableFinalizing == true):
-        // Run full post-processing / finalizing pass for maximum accuracy:
-        statusMessage = "Processing final transcript..."
-        ToastWindowController.shared.showToast(status: "Finalizing...", text: liveText, audioLevel: 0.0)
         
         AudioTranscriber.shared.resetAbort()
         // Run finalizing/flush pass (either whole audio or uncommitted tail + committedPrefix)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
+            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel, language: self.selectedLanguage) else {
                 DispatchQueue.main.async {
                     guard self.activeSessionID == sessionID else { return }
                     self.activeSessionID = nil
-                    ToastWindowController.shared.hideToast()
-                    self.statusMessage = "Model error"
+                    self.statusMessage = "No speech model found"
+                    ToastWindowController.shared.showToast(status: "No speech model found", text: "Download a model in settings to enable dictation.", audioLevel: 0.0)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { ToastWindowController.shared.hideToast() }
                 }
                 return
             }

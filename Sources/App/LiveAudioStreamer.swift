@@ -12,7 +12,7 @@ public final class RealtimeAudioRingBuffer {
     
     private(set) public var droppedSampleCount: Int = 0
     
-    public init(capacity: Int = 131072) { // 131,072 samples = 8.192 seconds at 16kHz
+    public init(capacity: Int = 4800000) { // 4,800,000 samples = 5 minutes at 16kHz
         self.capacity = capacity
         self.buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacity)
         self.buffer.initialize(repeating: 0, count: capacity)
@@ -99,6 +99,7 @@ public final class LiveAudioStreamer {
     
     // Pre-allocated conversion buffer reused on real-time thread (zero heap allocations)
     private var conversionBuffer: AVAudioPCMBuffer?
+    private var monoMixBuffer: AVAudioPCMBuffer?
     private var audioConverter: AVAudioConverter?
     
     public var onVolumeChanged: ((Float) -> Void)?
@@ -162,8 +163,26 @@ public final class LiveAudioStreamer {
             throw AudioLoaderError.conversionFailed("Could not create 16kHz mono audio format.")
         }
         
-        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            throw AudioLoaderError.conversionFailed("Could not instantiate audio converter from \(inputFormat) to 16kHz mono.")
+        let intermediateFormat: AVAudioFormat
+        if inputFormat.channelCount > 1 {
+            guard let monoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                              sampleRate: inputFormat.sampleRate,
+                                              channels: 1,
+                                              interleaved: false) else {
+                throw AudioLoaderError.conversionFailed("Could not create intermediate mono format.")
+            }
+            intermediateFormat = monoFmt
+            guard let monoBuf = AVAudioPCMBuffer(pcmFormat: monoFmt, frameCapacity: 16384) else {
+                throw AudioLoaderError.conversionFailed("Failed to pre-allocate mono mixing buffer.")
+            }
+            self.monoMixBuffer = monoBuf
+        } else {
+            intermediateFormat = inputFormat
+            self.monoMixBuffer = nil
+        }
+        
+        guard let converter = AVAudioConverter(from: intermediateFormat, to: targetFormat) else {
+            throw AudioLoaderError.conversionFailed("Could not instantiate audio converter from \(intermediateFormat) to 16kHz mono.")
         }
         self.audioConverter = converter
         
@@ -206,6 +225,27 @@ public final class LiveAudioStreamer {
             }
             
             // Zero dynamic memory allocation on CoreAudio real-time thread.
+            // Downmix multi-channel audio to mono so no channels are dropped:
+            let bufferToConvert: AVAudioPCMBuffer
+            if let monoMix = self.monoMixBuffer,
+               let inChannels = buffer.floatChannelData,
+               let outMono = monoMix.floatChannelData?[0] {
+                let channelCount = Int(buffer.format.channelCount)
+                let frameCount = Int(buffer.frameLength)
+                let invCh = 1.0 / Float(channelCount)
+                for i in 0..<frameCount {
+                    var sum: Float = 0.0
+                    for ch in 0..<channelCount {
+                        sum += inChannels[ch][i]
+                    }
+                    outMono[i] = sum * invCh
+                }
+                monoMix.frameLength = buffer.frameLength
+                bufferToConvert = monoMix
+            } else {
+                bufferToConvert = buffer
+            }
+            
             // Reset frameLength to full capacity on pre-allocated conversionBuffer and convert in-place.
             convertedBuffer.frameLength = convertedBuffer.frameCapacity
             var error: NSError?
@@ -214,7 +254,7 @@ public final class LiveAudioStreamer {
                 if !isDone {
                     isDone = true
                     outStatus.pointee = .haveData
-                    return buffer
+                    return bufferToConvert
                 } else {
                     outStatus.pointee = .noDataNow
                     return nil

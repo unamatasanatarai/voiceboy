@@ -127,34 +127,44 @@ public final class AudioLoader {
         
         var startIndex = 0
         var endIndex = samples.count
-        
+
+        func windowRms(at offset: Int) -> Float {
+            var sumSq: Float = 0.0
+            for j in 0..<windowSize {
+                let v = samples[offset + j]
+                sumSq += v * v
+            }
+            return sqrt(sumSq / Float(windowSize))
+        }
+
+        // Adapt threshold to the microphone's noise floor (10th percentile window RMS) so quiet
+        // mics and soft sentence endings aren't mistaken for silence. Never exceed `threshold`.
+        var windowLevels: [Float] = []
+        var w = 0
+        while w + windowSize <= samples.count {
+            windowLevels.append(windowRms(at: w))
+            w += windowSize
+        }
+        windowLevels.sort()
+        let noiseFloor = windowLevels[windowLevels.count / 10]
+        let effectiveThreshold = min(threshold, max(0.002, noiseFloor * 2.5))
+
         // Find speech onset
         var i = 0
         while i + windowSize <= samples.count {
-            var sumSq: Float = 0.0
-            for j in 0..<windowSize {
-                let v = samples[i + j]
-                sumSq += v * v
-            }
-            let rms = sqrt(sumSq / Float(windowSize))
-            if rms > threshold {
+            if windowRms(at: i) > effectiveThreshold {
                 startIndex = max(0, i - sampleRate / 10) // 100ms lead-in padding
                 break
             }
             i += windowSize
         }
-        
+
         // Find speech offset
         var k = samples.count - windowSize
         while k >= startIndex {
-            var sumSq: Float = 0.0
-            for j in 0..<windowSize {
-                let v = samples[k + j]
-                sumSq += v * v
-            }
-            let rms = sqrt(sumSq / Float(windowSize))
-            if rms > threshold {
-                endIndex = min(samples.count, k + windowSize + sampleRate / 10) // 100ms lead-out padding
+            if windowRms(at: k) > effectiveThreshold {
+                // 300ms lead-out padding: trailing consonants and falling intonation are quiet
+                endIndex = min(samples.count, k + windowSize + sampleRate * 3 / 10)
                 break
             }
             k -= windowSize

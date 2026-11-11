@@ -12,29 +12,8 @@ public class AppState: ObservableObject {
             UserDefaults.standard.set(selectedModel, forKey: AppState.selectedModelDefaultsKey)
         }
     }
-    @Published public var selectedLanguage: String = "en" {
-        didSet {
-            UserDefaults.standard.set(selectedLanguage, forKey: AppState.selectedLanguageDefaultsKey)
-            if selectedLanguage == "pl" && AudioTranscriber.isEnglishOnlyModel(selectedModel) {
-                if ModelDownloadManager.shared.isModelDownloaded("voice-input-multilingual-74.bin") {
-                    selectedModel = "voice-input-multilingual-74.bin"
-                } else if ModelDownloadManager.shared.isModelDownloaded("voice-input-multilingual-244.bin") {
-                    selectedModel = "voice-input-multilingual-244.bin"
-                }
-            } else if selectedLanguage == "en" && selectedModel.contains("multilingual") {
-                let englishCandidates = [
-                    "asr4all-s", "asr4all-m", "asr4all-l",
-                    "asr4all-s-plus", "asr4all-m-plus", "asr4all-l-plus"
-                ]
-                if let match = englishCandidates.first(where: { ModelDownloadManager.shared.isModelDownloaded($0) }) {
-                    selectedModel = match
-                }
-            }
-        }
-    }
     
     private static let selectedModelDefaultsKey = "VoiceBoy_SelectedModel"
-    private static let selectedLanguageDefaultsKey = "VoiceBoy_SelectedLanguage"
     private static let finalizingDefaultsKey = "VoiceBoy_EnableFinalizing"
     private static let recordingsDirDefaultsKey = "VoiceBoy_RecordingsDirectory"
     private static let showDockIconDefaultsKey = "VoiceBoy_ShowDockIcon"
@@ -108,7 +87,33 @@ public class AppState: ObservableObject {
     private var committedPrefixText: String = ""
     private var committedSampleOffset: Int = 0
     private var lastTranscribedSampleCount: Int = 0
-    
+    private var liveSessionGeneration: UInt64 = 0
+    private var usingIncrementalAsr4allStream: Bool = false
+    private var asr4allStreamStartedForSession: Bool = false
+    private var asr4allLiveStreamDisabled: Bool = false
+
+    /// Whether stopRecording may paste the live text directly instead of running a final pass.
+    /// ASR4ALL streams always need finish(): the engine holds up to one window of unprocessed audio
+    /// (plus the PCEC end-of-utterance flush) that is never reflected in the live preview.
+    static func shouldPasteLivePreviewOnStop(
+        enableFinalizing: Bool,
+        usingIncrementalAsr4allStream: Bool,
+        totalSamples: Int,
+        lastTranscribedSampleCount: Int,
+        liveText: String
+    ) -> Bool {
+        guard !enableFinalizing, !usingIncrementalAsr4allStream else { return false }
+        let liveCoversAllAudio = totalSamples - lastTranscribedSampleCount < 16000 / 10
+        return liveCoversAllAudio && !liveText.isEmpty && liveText != "[Silence / No speech detected]"
+    }
+
+    /// Errors that will recur on every live tick (model missing, integrity/load failure) and should stop
+    /// further live steps for the session instead of being retried every 0.7 s.
+    static func isFatalLiveStreamError(_ error: Error) -> Bool {
+        if case TranscriberError.transcriptionCancelled = error { return false }
+        return true
+    }
+
     private init() {
         let initialHotkey = KeyboardShortcuts.getShortcut(for: .toggleDictation) ?? .default
         self.currentHotkey = initialHotkey
@@ -134,16 +139,12 @@ public class AppState: ObservableObject {
             self.showDockIcon = false
         }
         
-        let savedLang = UserDefaults.standard.string(forKey: AppState.selectedLanguageDefaultsKey) ?? "en"
-        let lang = (savedLang == "pl" || savedLang == "en") ? savedLang : "en"
-        self.selectedLanguage = lang
-        
         let storedModel = UserDefaults.standard.string(forKey: AppState.selectedModelDefaultsKey)
         let validStoredModel = storedModel.flatMap { name in
             AudioTranscriber.knownModels.contains(where: { $0.filename == name }) ? name : nil
         }
-        let initialModel = validStoredModel ?? (lang == "pl" ? "voice-input-multilingual-74.bin" : "asr4all-s")
-        if let resolved = AudioTranscriber.resolveModelPath(named: initialModel, language: lang) {
+        let initialModel = validStoredModel ?? "asr4all-s"
+        if let resolved = AudioTranscriber.resolveModelPath(named: initialModel) {
             let actualName = URL(fileURLWithPath: resolved).lastPathComponent
             self.selectedModel = actualName
         } else {
@@ -214,7 +215,7 @@ public class AppState: ObservableObject {
                 return
             }
             
-            guard let resolvedModel = AudioTranscriber.resolveModelPath(named: self.selectedModel, language: self.selectedLanguage) else {
+            guard let resolvedModel = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
                 self.statusMessage = "No speech model found"
                 ToastWindowController.shared.showToast(status: "No speech model installed", text: "Open VoiceBoy settings to download a speech model.", audioLevel: 0.0)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { ToastWindowController.shared.hideToast() }
@@ -229,7 +230,12 @@ public class AppState: ObservableObject {
             do {
                 let sessionID = UUID()
                 self.activeSessionID = sessionID
-                AudioTranscriber.shared.resetAbort()
+                let sessionGen = AudioTranscriber.shared.abortAndAdvanceGeneration()
+                _ = AudioTranscriber.shared.resetAbort(ifMatchingGeneration: sessionGen)
+                self.liveSessionGeneration = sessionGen
+                self.usingIncrementalAsr4allStream = AudioTranscriber.isAsr4allBundle(at: resolvedModel)
+                self.asr4allStreamStartedForSession = false
+                self.asr4allLiveStreamDisabled = false
                 self.liveText = ""
                 self.statusMessage = "Recording..."
                 self.isRecording = true
@@ -289,6 +295,61 @@ public class AppState: ObservableObject {
     private func runLiveCycle() {
         guard isRecording, !isTranscribingChunk else { return }
         guard let sessionID = self.activeSessionID else { return }
+        let sessionGen = self.liveSessionGeneration
+        
+        if usingIncrementalAsr4allStream {
+            guard !asr4allLiveStreamDisabled else { return }
+            let (_, totalCount) = streamer.drainSamples(since: Int.max)
+            guard Double(totalCount - lastTranscribedSampleCount) / 16000.0 >= 0.5 else { return }
+            
+            let needsRestart = !asr4allStreamStartedForSession
+            asr4allStreamStartedForSession = true
+            isTranscribingChunk = true
+            
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
+                    DispatchQueue.main.async { self.isTranscribingChunk = false }
+                    return
+                }
+                do {
+                    let (fullText, _) = try AudioTranscriber.shared.stepAsr4allStream(
+                        modelPath: modelPath,
+                        tierName: "stream_c16r4",
+                        restartStream: needsRestart,
+                        expectedGeneration: sessionGen,
+                        sampleSliceProvider: { [weak self] fromOffset in
+                            guard let self = self else { return [] }
+                            return self.streamer.drainSamples(since: fromOffset).chunk
+                        }
+                    )
+                    DispatchQueue.main.async {
+                        guard self.activeSessionID == sessionID, self.isRecording else {
+                            self.isTranscribingChunk = false
+                            return
+                        }
+                        self.liveText = fullText
+                        self.lastTranscribedSampleCount = self.streamer.drainSamples(since: Int.max).totalCount
+                        ToastWindowController.shared.showToast(
+                            status: "Dictating (\(self.currentHotkey.displayString) finish • Esc cancel)",
+                            text: fullText,
+                            audioLevel: 0.2
+                        )
+                        self.isTranscribingChunk = false
+                    }
+                } catch {
+                    let fatal = AppState.isFatalLiveStreamError(error)
+                    DispatchQueue.main.async {
+                        self.isTranscribingChunk = false
+                        guard fatal, self.activeSessionID == sessionID, self.isRecording else { return }
+                        // Stop retrying (each retry re-runs model load + integrity hashing); stop() reports via finish.
+                        self.asr4allLiveStreamDisabled = true
+                        self.statusMessage = "Live preview unavailable: \(error.localizedDescription)"
+                    }
+                }
+            }
+            return
+        }
         
         let samples = streamer.getSamplesSnapshot()
         let totalCount = samples.count
@@ -303,7 +364,7 @@ public class AppState: ObservableObject {
         isTranscribingChunk = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel, language: self.selectedLanguage) else {
+            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
                 DispatchQueue.main.async { self.isTranscribingChunk = false }
                 return
             }
@@ -317,7 +378,7 @@ public class AppState: ObservableObject {
                     let prefixSlice = Array(samples[activeStart..<splitPoint])
                     let prefixDur = Double(prefixSlice.count) / 16000.0
                     let prefixAudio = AudioData(samples: prefixSlice, originalDurationSec: prefixDur, trimmedDurationSec: prefixDur, sampleRate: 16000)
-                    if let prefixRes = try? AudioTranscriber.shared.transcribe(audioData: prefixAudio, modelPath: modelPath, useDynamicContext: true, language: self.selectedLanguage) {
+                    if let prefixRes = try? AudioTranscriber.shared.transcribe(audioData: prefixAudio, modelPath: modelPath, useDynamicContext: true, language: "auto", expectedGeneration: sessionGen) {
                         let trimmedPrefix = prefixRes.text.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmedPrefix.isEmpty {
                             activeStart = splitPoint
@@ -347,7 +408,8 @@ public class AppState: ObservableObject {
                     audioData: audio,
                     modelPath: modelPath,
                     useDynamicContext: true,
-                    language: self.selectedLanguage
+                    language: "auto",
+                    expectedGeneration: sessionGen
                 )
                 
                 DispatchQueue.main.async {
@@ -386,7 +448,8 @@ public class AppState: ObservableObject {
     public func cancelRecording() {
         guard isRecording || activeSessionID != nil else { return }
         self.activeSessionID = nil
-        AudioTranscriber.shared.abortCurrentTranscription()
+        self.liveSessionGeneration = AudioTranscriber.shared.abortAndAdvanceGeneration()
+        AudioTranscriber.shared.cancelAsr4allStreamAsync()
         
         GlobalHotkeyManager.shared.stopEscapeMonitoring()
         liveTimer?.invalidate()
@@ -398,7 +461,10 @@ public class AppState: ObservableObject {
         committedPrefixText = ""
         committedSampleOffset = 0
         lastTranscribedSampleCount = 0
-        
+        usingIncrementalAsr4allStream = false
+        asr4allStreamStartedForSession = false
+        asr4allLiveStreamDisabled = false
+
         statusMessage = "Dictation cancelled (Esc)"
         ToastWindowController.shared.showToast(status: "Cancelled", text: "", audioLevel: 0.0)
         
@@ -416,11 +482,14 @@ public class AppState: ObservableObject {
         streamer.stop()
         isRecording = false
         
-        // If an incremental live chunk is executing in whisper, abort it immediately
-        // so the serial transcriber queue is freed instantly and CPU does not backlog
-        if isTranscribingChunk {
-            AudioTranscriber.shared.abortCurrentTranscription()
-        }
+        // Advance generation token so stale queued live chunks reject themselves cleanly inside queue.sync.
+        // ASR4ALL streams must NOT abort an in-flight step: aborting discards the incremental stream and forces
+        // finish() to re-feed the whole recording (O(N)); letting the step complete keeps finish() O(tail).
+        // Whisper live chunks are independent batch passes, so aborting them frees the queue for the final pass.
+        let finalizeGen = usingIncrementalAsr4allStream
+            ? AudioTranscriber.shared.advanceGenerationWithoutAbort()
+            : AudioTranscriber.shared.abortAndAdvanceGeneration()
+        self.liveSessionGeneration = finalizeGen
         isTranscribingChunk = false
         
         let samples = streamer.getSamplesSnapshot()
@@ -433,6 +502,7 @@ public class AppState: ObservableObject {
         // Guard against zero recorded audio
         guard !samples.isEmpty else {
             self.activeSessionID = nil
+            AudioTranscriber.shared.cancelAsr4allStreamAsync()
             ToastWindowController.shared.hideToast()
             statusMessage = "No audio detected"
             return
@@ -445,9 +515,15 @@ public class AppState: ObservableObject {
         // Otherwise the words spoken after the last live cycle would be dropped, so flush the
         // uncommitted tail below (fast: at most a few seconds of audio) without the "Finalizing..." UI.
         if !enableFinalizing {
-            let liveCoversAllAudio = samples.count - lastTranscribedSampleCount < 16000 / 10
-            if liveCoversAllAudio && !currentLive.isEmpty && currentLive != "[Silence / No speech detected]" {
+            if AppState.shouldPasteLivePreviewOnStop(
+                enableFinalizing: enableFinalizing,
+                usingIncrementalAsr4allStream: usingIncrementalAsr4allStream,
+                totalSamples: samples.count,
+                lastTranscribedSampleCount: lastTranscribedSampleCount,
+                liveText: currentLive
+            ) {
                 self.activeSessionID = nil
+                AudioTranscriber.shared.cancelAsr4allStreamAsync()
                 self.lastTranscript = currentLive
                 self.statusMessage = "Pasted live transcript"
                 ToastWindowController.shared.hideToast {
@@ -462,11 +538,10 @@ public class AppState: ObservableObject {
             ToastWindowController.shared.showToast(status: "Finalizing...", text: liveText, audioLevel: 0.0)
         }
         
-        AudioTranscriber.shared.resetAbort()
-        // Run finalizing/flush pass (either whole audio or uncommitted tail + committedPrefix)
+        // Run finalizing/flush pass asynchronously; expectedGeneration: finalizeGen safely resets abort inside queue.sync.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel, language: self.selectedLanguage) else {
+            guard let modelPath = AudioTranscriber.resolveModelPath(named: self.selectedModel) else {
                 DispatchQueue.main.async {
                     guard self.activeSessionID == sessionID else { return }
                     self.activeSessionID = nil
@@ -477,42 +552,60 @@ public class AppState: ObservableObject {
                 return
             }
             
-            // If we have a committed prefix, only transcribe the remaining uncommitted tail audio
-            let samplesToTranscribe: [Float]
-            let prefixToPrepend: String
-            if self.committedSampleOffset > 0 && !self.committedPrefixText.isEmpty && self.committedSampleOffset < samples.count {
-                samplesToTranscribe = Array(samples[self.committedSampleOffset..<samples.count])
-                prefixToPrepend = self.committedPrefixText
-            } else {
-                samplesToTranscribe = samples
-                prefixToPrepend = ""
-            }
-            
-            let dur = Double(samplesToTranscribe.count) / 16000.0
-            let (trimmed, trimmedDur) = AudioLoader.stripLeadingAndTrailingSilence(samples: samplesToTranscribe, sampleRate: 16000)
-            let audio = AudioData(
-                samples: trimmed.isEmpty ? samplesToTranscribe : trimmed,
-                originalDurationSec: dur,
-                trimmedDurationSec: trimmed.isEmpty ? dur : trimmedDur,
-                sampleRate: 16000
-            )
-            
             do {
-                let result = try AudioTranscriber.shared.transcribe(
-                    audioData: audio,
-                    modelPath: modelPath,
-                    useDynamicContext: true,
-                    language: self.selectedLanguage
-                )
-                
-                let activeText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 let finalText: String
-                if prefixToPrepend.isEmpty {
-                    finalText = activeText
-                } else if activeText.isEmpty {
-                    finalText = prefixToPrepend
+                let result: TranscriptionResult
+                if AudioTranscriber.isAsr4allBundle(at: modelPath) {
+                    let dur = Double(samples.count) / 16000.0
+                    result = try AudioTranscriber.shared.finishAsr4allStream(
+                        modelPath: modelPath,
+                        tierName: "stream_c16r4",
+                        originalDurationSec: dur,
+                        trimmedDurationSec: dur,
+                        expectedGeneration: finalizeGen,
+                        sampleSliceProvider: { fromOffset in
+                            guard fromOffset < samples.count else { return [] }
+                            return Array(samples[fromOffset..<samples.count])
+                        }
+                    )
+                    finalText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 } else {
-                    finalText = "\(prefixToPrepend) \(activeText)"
+                    // If we have a committed prefix, only transcribe the remaining uncommitted tail audio
+                    let samplesToTranscribe: [Float]
+                    let prefixToPrepend: String
+                    if self.committedSampleOffset > 0 && !self.committedPrefixText.isEmpty && self.committedSampleOffset < samples.count {
+                        samplesToTranscribe = Array(samples[self.committedSampleOffset..<samples.count])
+                        prefixToPrepend = self.committedPrefixText
+                    } else {
+                        samplesToTranscribe = samples
+                        prefixToPrepend = ""
+                    }
+                    
+                    let dur = Double(samplesToTranscribe.count) / 16000.0
+                    let (trimmed, trimmedDur) = AudioLoader.stripLeadingAndTrailingSilence(samples: samplesToTranscribe, sampleRate: 16000)
+                    let audio = AudioData(
+                        samples: trimmed.isEmpty ? samplesToTranscribe : trimmed,
+                        originalDurationSec: dur,
+                        trimmedDurationSec: trimmed.isEmpty ? dur : trimmedDur,
+                        sampleRate: 16000
+                    )
+                    
+                    result = try AudioTranscriber.shared.transcribe(
+                        audioData: audio,
+                        modelPath: modelPath,
+                        useDynamicContext: true,
+                        language: "auto",
+                        expectedGeneration: finalizeGen
+                    )
+                    
+                    let activeText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if prefixToPrepend.isEmpty {
+                        finalText = activeText
+                    } else if activeText.isEmpty {
+                        finalText = prefixToPrepend
+                    } else {
+                        finalText = "\(prefixToPrepend) \(activeText)"
+                    }
                 }
                 
                 DispatchQueue.main.async {

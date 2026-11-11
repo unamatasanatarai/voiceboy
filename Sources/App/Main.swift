@@ -48,7 +48,7 @@ func runCLI(arguments: [String]) {
     
     var audioPath: String?
     var modelName = "voice-input-multilingual-244.bin"
-    var language = "en"
+    var language = "auto"
     var useDynamicContext = true
     var trimSilence = true
     

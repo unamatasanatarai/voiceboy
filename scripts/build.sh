@@ -57,18 +57,23 @@ fi
 # Ensure ONNX Runtime (macOS universal2, minOS 11.0+) is ready for ASR4ALL models
 ort_dir="${project_dir}/deps/onnxruntime"
 ort_version="1.19.2"
+ort_sha256="b0289ddbc32f76e5d385abc7b74cc7c2c51cdf2285b7d118bf9d71206e5aee3a"
 ort_header="${ort_dir}/include/onnxruntime_c_api.h"
 ort_dylib="${ort_dir}/lib/libonnxruntime.${ort_version}.dylib"
 if [[ ! -f "$ort_header" || ! -f "$ort_dylib" ]]; then
     printf '%s\n' "==> ONNX Runtime v${ort_version} missing; downloading macOS universal2 release..."
     mkdir -p "$ort_dir"
     ort_tgz="${cache_dir}/onnxruntime-osx-universal2-${ort_version}.tgz"
-    curl -L --fail --progress-bar \
+    curl -L --fail --proto '=https' --tlsv1.2 --progress-bar \
         "https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-osx-universal2-${ort_version}.tgz" \
         -o "$ort_tgz"
-    ort_tmp="${cache_dir}/ort-extract-$$"
-    rm -rf "$ort_tmp"
-    mkdir -p "$ort_tmp"
+    actual_sha256="$(shasum -a 256 "$ort_tgz" | awk '{print $1}')"
+    if [[ "$actual_sha256" != "$ort_sha256" ]]; then
+        rm -f "$ort_tgz"
+        printf '%s\n' "Error: ONNX Runtime checksum mismatch (expected ${ort_sha256}, got ${actual_sha256})" >&2
+        exit 1
+    fi
+    ort_tmp="$(mktemp -d "${TMPDIR:-/tmp}/ort-extract.XXXXXX")"
     tar -xzf "$ort_tgz" -C "$ort_tmp"
     rm -rf "${ort_dir}/include" "${ort_dir}/lib"
     cp -R "${ort_tmp}/onnxruntime-osx-universal2-${ort_version}/include" "${ort_dir}/include"
@@ -143,7 +148,6 @@ swiftc -sdk "$sdk_path" \
     -L "${ort_dir}/lib" \
     -lonnxruntime \
     -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
-    -Xlinker -rpath -Xlinker "${ort_dir}/lib" \
     -lc++ \
     -framework Accelerate \
     -framework Metal \

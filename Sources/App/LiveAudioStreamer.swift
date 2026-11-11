@@ -164,6 +164,7 @@ public final class LiveAudioStreamer {
         }
         
         let intermediateFormat: AVAudioFormat
+        let monoBufCapacity = AVAudioFrameCount(max(16384, Int(ceil(inputFormat.sampleRate * 0.5))))
         if inputFormat.channelCount > 1 {
             guard let monoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                               sampleRate: inputFormat.sampleRate,
@@ -172,13 +173,18 @@ public final class LiveAudioStreamer {
                 throw AudioLoaderError.conversionFailed("Could not create intermediate mono format.")
             }
             intermediateFormat = monoFmt
-            guard let monoBuf = AVAudioPCMBuffer(pcmFormat: monoFmt, frameCapacity: 16384) else {
+            guard let monoBuf = AVAudioPCMBuffer(pcmFormat: monoFmt, frameCapacity: monoBufCapacity) else {
                 throw AudioLoaderError.conversionFailed("Failed to pre-allocate mono mixing buffer.")
             }
             self.monoMixBuffer = monoBuf
         } else {
             intermediateFormat = inputFormat
-            self.monoMixBuffer = nil
+            if inputFormat.commonFormat == .pcmFormatFloat32,
+               let monoBuf = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: monoBufCapacity) {
+                self.monoMixBuffer = monoBuf
+            } else {
+                self.monoMixBuffer = nil
+            }
         }
         
         guard let converter = AVAudioConverter(from: intermediateFormat, to: targetFormat) else {
@@ -186,15 +192,19 @@ public final class LiveAudioStreamer {
         }
         self.audioConverter = converter
         
-        // Pre-allocate conversion buffer outside real-time callback (8192 frames = >500ms headroom)
-        guard let preallocated = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: 8192) else {
+        // Pre-allocate conversion buffer outside real-time callback (16384 frames = >1.0s headroom at 16kHz)
+        guard let preallocated = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: 16384) else {
             throw AudioLoaderError.conversionFailed("Failed to pre-allocate real-time conversion buffer.")
         }
         self.conversionBuffer = preallocated
         
         consumerLock.lock()
         ringBuffer.reset()
-        accumulatedSamples.removeAll(keepingCapacity: true)
+        if accumulatedSamples.capacity > 480_000 {
+            accumulatedSamples = []
+        } else {
+            accumulatedSamples.removeAll(keepingCapacity: true)
+        }
         consumerLock.unlock()
         
         let bufferSize = AVAudioFrameCount(inputFormat.sampleRate * 0.1) // 100ms chunks
@@ -224,49 +234,13 @@ public final class LiveAudioStreamer {
                 self.onVolumeChanged?(maxRms)
             }
             
-            // Zero dynamic memory allocation on CoreAudio real-time thread.
-            // Downmix multi-channel audio to mono so no channels are dropped:
-            let bufferToConvert: AVAudioPCMBuffer
-            if let monoMix = self.monoMixBuffer,
-               let inChannels = buffer.floatChannelData,
-               let outMono = monoMix.floatChannelData?[0] {
-                let channelCount = Int(buffer.format.channelCount)
-                let frameCount = Int(buffer.frameLength)
-                let invCh = 1.0 / Float(channelCount)
-                for i in 0..<frameCount {
-                    var sum: Float = 0.0
-                    for ch in 0..<channelCount {
-                        sum += inChannels[ch][i]
-                    }
-                    outMono[i] = sum * invCh
-                }
-                monoMix.frameLength = buffer.frameLength
-                bufferToConvert = monoMix
-            } else {
-                bufferToConvert = buffer
-            }
-            
-            // Reset frameLength to full capacity on pre-allocated conversionBuffer and convert in-place.
-            convertedBuffer.frameLength = convertedBuffer.frameCapacity
-            var error: NSError?
-            var isDone = false
-            let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-                if !isDone {
-                    isDone = true
-                    outStatus.pointee = .haveData
-                    return bufferToConvert
-                } else {
-                    outStatus.pointee = .noDataNow
-                    return nil
-                }
-            }
-            
-            converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
-            if error == nil, let outData = convertedBuffer.floatChannelData?[0] {
-                let frameCount = Int(convertedBuffer.frameLength)
-                // Write directly into ring buffer without any Array heap allocations or mutex contention
-                self.ringBuffer.write(from: outData, count: frameCount)
-            }
+            Self.processTapBuffer(
+                buffer,
+                monoMixBuffer: self.monoMixBuffer,
+                converter: converter,
+                conversionBuffer: convertedBuffer,
+                ringBuffer: self.ringBuffer
+            )
         }
         
         audioEngine.prepare()
@@ -310,6 +284,96 @@ public final class LiveAudioStreamer {
         defer { consumerLock.unlock() }
         ringBuffer.drain(into: &accumulatedSamples)
         return accumulatedSamples
+    }
+    
+    /// Drains newly recorded 16kHz samples from the ring buffer and returns ONLY `[offset...]`
+    /// along with the updated total sample count, avoiding O(N) prefix copies on live ticks.
+    public func drainSamples(since offset: Int) -> (chunk: [Float], totalCount: Int) {
+        consumerLock.lock()
+        defer { consumerLock.unlock() }
+        ringBuffer.drain(into: &accumulatedSamples)
+        let safeOffset = min(max(0, offset), accumulatedSamples.count)
+        return (Array(accumulatedSamples[safeOffset...]), accumulatedSamples.count)
+    }
+    
+    private static func _convertSingleChunk(
+        _ inputBuffer: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        conversionBuffer: AVAudioPCMBuffer,
+        ringBuffer: RealtimeAudioRingBuffer
+    ) {
+        conversionBuffer.frameLength = conversionBuffer.frameCapacity
+        var error: NSError?
+        var isDone = false
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+            if !isDone {
+                isDone = true
+                outStatus.pointee = .haveData
+                return inputBuffer
+            } else {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+        }
+        converter.convert(to: conversionBuffer, error: &error, withInputFrom: inputBlock)
+        if error == nil, let outData = conversionBuffer.floatChannelData?[0] {
+            let frameCount = Int(conversionBuffer.frameLength)
+            ringBuffer.write(from: outData, count: frameCount)
+        }
+    }
+    
+    /// Real-time safe CoreAudio tap helper: bounds-checked chunked downmix & resampling into `ringBuffer`.
+    public static func processTapBuffer(
+        _ buffer: AVAudioPCMBuffer,
+        monoMixBuffer: AVAudioPCMBuffer?,
+        converter: AVAudioConverter,
+        conversionBuffer: AVAudioPCMBuffer,
+        ringBuffer: RealtimeAudioRingBuffer
+    ) {
+        let totalFrames = Int(buffer.frameLength)
+        guard totalFrames > 0 else { return }
+        
+        let outCap = Int(conversionBuffer.frameCapacity)
+        let ratio = converter.outputFormat.sampleRate / max(1.0, converter.inputFormat.sampleRate)
+        let maxOutputDrivenInput = max(1, Int(floor(Double(max(65, outCap) - 64) / max(0.01, ratio))))
+        let channelCount = max(1, Int(buffer.format.channelCount))
+        
+        // Zero-copy fast path for mono buffers that already fit within the conversion capacity
+        if channelCount == 1 && totalFrames <= maxOutputDrivenInput {
+            _convertSingleChunk(buffer, converter: converter, conversionBuffer: conversionBuffer, ringBuffer: ringBuffer)
+            return
+        }
+        
+        if let monoMix = monoMixBuffer,
+           let inChannels = buffer.floatChannelData,
+           let outMono = monoMix.floatChannelData?[0] {
+            let invCh = 1.0 / Float(channelCount)
+            let monoCap = max(1, Int(monoMix.frameCapacity))
+            let maxChunk = min(monoCap, maxOutputDrivenInput)
+            
+            var offset = 0
+            while offset < totalFrames {
+                let chunkFrames = min(totalFrames - offset, maxChunk)
+                if channelCount == 1 {
+                    outMono.assign(from: inChannels[0].advanced(by: offset), count: chunkFrames)
+                } else {
+                    for i in 0..<chunkFrames {
+                        var sum: Float = 0.0
+                        for ch in 0..<channelCount {
+                            sum += inChannels[ch][offset + i]
+                        }
+                        outMono[i] = sum * invCh
+                    }
+                }
+                monoMix.frameLength = AVAudioFrameCount(chunkFrames)
+                _convertSingleChunk(monoMix, converter: converter, conversionBuffer: conversionBuffer, ringBuffer: ringBuffer)
+                offset += chunkFrames
+            }
+            return
+        }
+        
+        // Fallback for non-float32 formats where monoMixBuffer is nil
+        _convertSingleChunk(buffer, converter: converter, conversionBuffer: conversionBuffer, ringBuffer: ringBuffer)
     }
     
     /// Saves the current recording buffer to the specified directory

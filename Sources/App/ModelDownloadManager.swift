@@ -1,7 +1,6 @@
 import Cocoa
 import SwiftUI
 import Combine
-import CryptoKit
 
 public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloadDelegate {
     public static let shared = ModelDownloadManager()
@@ -23,6 +22,7 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
     private var activeTasks: [String: URLSessionDownloadTask] = [:]
     private var activeBundleDownloads: [String: BundleDownloadState] = [:]
     private var taskToFilename: [Int: String] = [:]
+    private var cancelledTaskIdentifiers: Set<Int> = []
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
         return URLSession(configuration: config, delegate: self, delegateQueue: .main)
@@ -60,10 +60,27 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
         "huggingface.co"
     ]
     
+    // CDN hostnames used by trusted model repositories on 302 redirects (e.g. HuggingFace LFS/Xet CAS).
+    public static let allowedRedirectHosts: Set<String> = [
+        "keyboard.futo.org",
+        "futo.org",
+        "huggingface.co",
+        "hf.co",
+        "xethub.hf.co"
+    ]
+    
+    private static func _matchesHTTPSHost(_ url: URL, allowedHosts: Set<String>) -> Bool {
+        guard url.scheme?.lowercased() == "https" else { return false }
+        guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
+        return allowedHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+    }
+    
     public static func isURLAllowedForDownload(_ url: URL) -> Bool {
-        guard url.scheme == "https" else { return false }
-        guard let host = url.host?.lowercased() else { return false }
-        return allowedDownloadHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+        return _matchesHTTPSHost(url, allowedHosts: allowedDownloadHosts)
+    }
+    
+    public static func isRedirectURLAllowed(_ url: URL) -> Bool {
+        return _matchesHTTPSHost(url, allowedHosts: allowedRedirectHosts)
     }
     
     public func startDownload(model: AudioTranscriber.ModelInfo) {
@@ -178,12 +195,14 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
     
     public func cancelDownload(filename: String) {
         if let task = activeTasks[filename] {
-            task.cancel()
+            cancelledTaskIdentifiers.insert(task.taskIdentifier)
             taskToFilename.removeValue(forKey: task.taskIdentifier)
             activeTasks.removeValue(forKey: filename)
+            task.cancel()
         }
         if let bundleState = activeBundleDownloads.removeValue(forKey: filename) {
             if let task = bundleState.activeTask {
+                cancelledTaskIdentifiers.insert(task.taskIdentifier)
                 taskToFilename.removeValue(forKey: task.taskIdentifier)
                 task.cancel()
             }
@@ -193,7 +212,44 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
         downloadProgress.removeValue(forKey: filename)
     }
     
+    private func _cleanupDownloadState(filename: String, taskIdentifier: Int? = nil, errorMessage: String? = nil) {
+        if let bundleState = activeBundleDownloads.removeValue(forKey: filename) {
+            try? FileManager.default.removeItem(at: bundleState.stagingDir)
+        }
+        if let tid = taskIdentifier {
+            taskToFilename.removeValue(forKey: tid)
+        }
+        activeTasks.removeValue(forKey: filename)
+        activeDownloads.remove(filename)
+        downloadProgress.removeValue(forKey: filename)
+        if let errorMessage = errorMessage {
+            self.lastError = errorMessage
+        }
+    }
+    
     // MARK: - URLSessionDownloadDelegate
+    public func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let nextURL = request.url, Self.isRedirectURLAllowed(nextURL) else {
+            let blockedURL = request.url?.absoluteString ?? "(nil)"
+            if let filename = taskToFilename[task.taskIdentifier] {
+                _cleanupDownloadState(
+                    filename: filename,
+                    taskIdentifier: task.taskIdentifier,
+                    errorMessage: "Download rejected: untrusted redirect target (\(blockedURL))"
+                )
+            }
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+    
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let filename = taskToFilename[downloadTask.taskIdentifier] else { return }
         if let bundleState = activeBundleDownloads[filename] {
@@ -211,44 +267,29 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
         }
     }
     
-    // MARK: - Integrity Verification (Issue 11)
+    // MARK: - Integrity Verification (Shared via AudioTranscriber)
     public static func computeSHA256(of url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while autoreleasepool(invoking: {
-            let chunk = handle.readData(ofLength: 1024 * 1024)
-            if chunk.isEmpty {
-                return false
-            }
-            hasher.update(data: chunk)
-            return true
-        }) {}
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return try AudioTranscriber.computeSHA256(of: url)
     }
     
     public static func verifyFileIntegrity(at url: URL, expectedSize: Int64, expectedSHA256: String) -> (isValid: Bool, error: String?) {
-        do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard let fileSize = attrs[.size] as? Int64 else {
-                return (false, "Could not determine downloaded file size")
-            }
-            if fileSize != expectedSize {
-                return (false, "Integrity check failed: file size mismatch (expected \(expectedSize) bytes, got \(fileSize) bytes)")
-            }
-            let computedSHA = try computeSHA256(of: url)
-            if computedSHA.lowercased() != expectedSHA256.lowercased() {
-                return (false, "Integrity check failed: SHA-256 checksum mismatch (expected \(expectedSHA256), got \(computedSHA))")
-            }
-            return (true, nil)
-        } catch {
-            return (false, "Integrity check failed: \(error.localizedDescription)")
-        }
+        return AudioTranscriber.verifyFileIntegrity(at: url, expectedSize: expectedSize, expectedSHA256: expectedSHA256)
     }
     
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let filename = taskToFilename[downloadTask.taskIdentifier] else { return }
+        
+        if let httpResp = downloadTask.response as? HTTPURLResponse, !(200...299).contains(httpResp.statusCode) {
+            try? FileManager.default.removeItem(at: location)
+            DispatchQueue.main.async {
+                self._cleanupDownloadState(
+                    filename: filename,
+                    taskIdentifier: downloadTask.taskIdentifier,
+                    errorMessage: "Download failed for \(filename): server returned HTTP \(httpResp.statusCode)"
+                )
+            }
+            return
+        }
         
         if var bundleState = activeBundleDownloads[filename] {
             taskToFilename.removeValue(forKey: downloadTask.taskIdentifier)
@@ -261,14 +302,10 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
             
             if !verification.isValid {
                 try? FileManager.default.removeItem(at: location)
-                try? FileManager.default.removeItem(at: bundleState.stagingDir)
                 let errorMsg = verification.error ?? "Downloaded model file \(fileSpec.relativePath) failed integrity check"
                 print("❌ [ModelDownloadManager] \(errorMsg)")
                 DispatchQueue.main.async {
-                    self.lastError = errorMsg
-                    self.activeBundleDownloads.removeValue(forKey: filename)
-                    self.activeDownloads.remove(filename)
-                    self.downloadProgress.removeValue(forKey: filename)
+                    self._cleanupDownloadState(filename: filename, errorMessage: errorMsg)
                 }
                 return
             }
@@ -290,12 +327,11 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
                 startNextBundleFileDownload(for: filename)
             } catch {
                 try? FileManager.default.removeItem(at: location)
-                try? FileManager.default.removeItem(at: bundleState.stagingDir)
                 DispatchQueue.main.async {
-                    self.lastError = "Failed to stage model file \(fileSpec.relativePath): \(error.localizedDescription)"
-                    self.activeBundleDownloads.removeValue(forKey: filename)
-                    self.activeDownloads.remove(filename)
-                    self.downloadProgress.removeValue(forKey: filename)
+                    self._cleanupDownloadState(
+                        filename: filename,
+                        errorMessage: "Failed to stage model file \(fileSpec.relativePath): \(error.localizedDescription)"
+                    )
                 }
             }
             return
@@ -316,11 +352,7 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
                 let errorMsg = verification.error ?? "Downloaded model failed integrity check"
                 print("❌ [ModelDownloadManager] \(errorMsg)")
                 DispatchQueue.main.async {
-                    self.lastError = errorMsg
-                    self.activeDownloads.remove(filename)
-                    self.downloadProgress.removeValue(forKey: filename)
-                    self.activeTasks.removeValue(forKey: filename)
-                    self.taskToFilename.removeValue(forKey: downloadTask.taskIdentifier)
+                    self._cleanupDownloadState(filename: filename, taskIdentifier: downloadTask.taskIdentifier, errorMessage: errorMsg)
                 }
                 return
             }
@@ -334,10 +366,7 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
             try FileManager.default.moveItem(at: location, to: destinationURL)
             
             DispatchQueue.main.async {
-                self.activeDownloads.remove(filename)
-                self.downloadProgress.removeValue(forKey: filename)
-                self.activeTasks.removeValue(forKey: filename)
-                self.taskToFilename.removeValue(forKey: downloadTask.taskIdentifier)
+                self._cleanupDownloadState(filename: filename, taskIdentifier: downloadTask.taskIdentifier)
                 self.downloadedModels.insert(filename)
                 
                 // If current selected model is not downloaded, activate this one
@@ -347,28 +376,25 @@ public class ModelDownloadManager: NSObject, ObservableObject, URLSessionDownloa
             }
         } catch {
             DispatchQueue.main.async {
-                self.lastError = "Failed to save model: \(error.localizedDescription)"
-                self.activeDownloads.remove(filename)
-                self.downloadProgress.removeValue(forKey: filename)
-                self.activeTasks.removeValue(forKey: filename)
-                self.taskToFilename.removeValue(forKey: downloadTask.taskIdentifier)
+                self._cleanupDownloadState(
+                    filename: filename,
+                    taskIdentifier: downloadTask.taskIdentifier,
+                    errorMessage: "Failed to save model: \(error.localizedDescription)"
+                )
             }
         }
     }
     
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let wasUserCancelled = cancelledTaskIdentifiers.remove(task.taskIdentifier) != nil
         guard let filename = taskToFilename[task.taskIdentifier] else { return }
-        if let error = error, (error as NSError).code != NSURLErrorCancelled {
-            if let bundleState = activeBundleDownloads.removeValue(forKey: filename) {
-                try? FileManager.default.removeItem(at: bundleState.stagingDir)
-            }
+        if let error = error {
+            let msg: String? = wasUserCancelled ? nil : "Download failed: \(error.localizedDescription)"
             DispatchQueue.main.async {
-                self.lastError = "Download failed: \(error.localizedDescription)"
-                self.activeDownloads.remove(filename)
-                self.downloadProgress.removeValue(forKey: filename)
-                self.activeTasks.removeValue(forKey: filename)
-                self.taskToFilename.removeValue(forKey: task.taskIdentifier)
+                self._cleanupDownloadState(filename: filename, taskIdentifier: task.taskIdentifier, errorMessage: msg)
             }
+        } else {
+            taskToFilename.removeValue(forKey: task.taskIdentifier)
         }
     }
 }

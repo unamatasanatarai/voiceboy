@@ -269,6 +269,40 @@ struct ExternalTensorSpec {
     uint64_t length = 0;
 };
 
+uint64_t parseStrictUint64(const std::string& s, const char* fieldName) {
+    if (s.empty()) {
+        throw std::runtime_error(std::string("Empty integer field: ") + fieldName);
+    }
+    for (unsigned char ch : s) {
+        if (ch < '0' || ch > '9') {
+            throw std::runtime_error(std::string("Invalid unsigned integer in ") + fieldName);
+        }
+    }
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long val = std::strtoull(s.c_str(), &end, 10);
+    if (errno == ERANGE || end != s.c_str() + s.size()) {
+        throw std::runtime_error(std::string("Integer overflow in ") + fieldName);
+    }
+    return static_cast<uint64_t>(val);
+}
+
+bool isSafeRelativeBundlePath(const std::string& rel) {
+    if (rel.empty() || rel[0] == '/') return false;
+    size_t i = 0;
+    while (i <= rel.size()) {
+        size_t slash = rel.find('/', i);
+        size_t end = (slash == std::string::npos) ? rel.size() : slash;
+        std::string seg = rel.substr(i, end - i);
+        if (seg.empty() || seg == "." || seg == ".." || seg.find('\\') != std::string::npos || seg.find('\0') != std::string::npos) {
+            return false;
+        }
+        if (slash == std::string::npos) break;
+        i = slash + 1;
+    }
+    return true;
+}
+
 uint64_t readVarint(const uint8_t* buf, size_t len, size_t& i) {
     uint64_t val = 0;
     int shift = 0;
@@ -346,8 +380,8 @@ std::vector<ExternalTensorSpec> parseExternalTensors(const uint8_t* modelBytes, 
                 }
             });
             if (location == 1 && !spec.name.empty() && !lengthStr.empty()) {
-                spec.offset = offsetStr.empty() ? 0ULL : std::stoull(offsetStr);
-                spec.length = std::stoull(lengthStr);
+                spec.offset = offsetStr.empty() ? 0ULL : parseStrictUint64(offsetStr, "external_data.offset");
+                spec.length = parseStrictUint64(lengthStr, "external_data.length");
                 out.push_back(std::move(spec));
             }
         });
@@ -566,6 +600,9 @@ struct Asr4allContext {
         if (gIt == graphFiles.end()) {
             throw std::runtime_error("Graph not found in metadata.json: " + graphName);
         }
+        if (!isSafeRelativeBundlePath(gIt->second)) {
+            throw std::runtime_error("Unsafe graph path in metadata.json: " + gIt->second);
+        }
         std::string graphPath = bundleDir + "/" + gIt->second;
         std::vector<uint8_t> modelBytes = readFileBytes(graphPath);
         std::vector<ExternalTensorSpec> extTensors = parseExternalTensors(modelBytes.data(), modelBytes.size());
@@ -579,7 +616,7 @@ struct Asr4allContext {
 
         if (weightsMap != nullptr) {
             for (const auto& t : extTensors) {
-                if (t.offset + t.length > weightsSize) {
+                if (t.offset > weightsSize || t.length > weightsSize - t.offset) {
                     throw std::runtime_error("External tensor out of bounds for " + t.name);
                 }
                 std::string key = std::to_string(t.offset) + ":" + std::to_string(t.length) + ":" + std::to_string(t.onnxDtype);
@@ -744,6 +781,26 @@ std::string renderPcecSlots(const Asr4allContext& ctx, const std::vector<int64_t
         result += w.punct;
     }
     return result;
+}
+
+void copyOrtValueToBuffer(const Ort::Value& src, TensorBuffer& dst) {
+    auto info = src.GetTensorTypeAndShapeInfo();
+    dst.shape = info.GetShape();
+    dst.elemType = info.GetElementType();
+    size_t bytes = info.GetElementCount();
+    if (dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 || dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE) {
+        bytes *= 8;
+    } else if (dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        bytes *= 2;
+    } else if (dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) {
+        bytes *= 1;
+    } else {
+        bytes *= 4;
+    }
+    dst.raw.resize(bytes);
+    if (bytes > 0) {
+        std::memcpy(dst.raw.data(), src.GetTensorRawData(), bytes);
+    }
 }
 
 struct PcecState {
@@ -912,27 +969,8 @@ struct PcecState {
             }
 
             // Update caches
-            auto copyOutToBuf = [](const Ort::Value& src, TensorBuffer& dst) {
-                auto info = src.GetTensorTypeAndShapeInfo();
-                dst.shape = info.GetShape();
-                dst.elemType = info.GetElementType();
-                size_t bytes = info.GetElementCount();
-                if (dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 || dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE) {
-                    bytes *= 8;
-                } else if (dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-                    bytes *= 2;
-                } else if (dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL) {
-                    bytes *= 1;
-                } else {
-                    bytes *= 4;
-                }
-                dst.raw.resize(bytes);
-                if (bytes > 0) {
-                    std::memcpy(dst.raw.data(), src.GetTensorRawData(), bytes);
-                }
-            };
-            copyOutToBuf(outs[1], stateBuf);
-            copyOutToBuf(outs[2], seenBuf);
+            copyOrtValueToBuffer(outs[1], stateBuf);
+            copyOrtValueToBuffer(outs[2], seenBuf);
 
             ids.erase(ids.begin(), ids.begin() + k);
             pause.erase(pause.begin(), pause.begin() + k);
@@ -943,16 +981,18 @@ struct PcecState {
         }
     }
 
-    std::vector<int64_t> tail(const Ort::MemoryInfo& memInfo, const Ort::RunOptions& runOpts) {
-        size_t n = ids.size();
+    std::vector<int64_t> tail(const Ort::MemoryInfo& memInfo, const Ort::RunOptions& runOpts, bool includeOpenToken = false) const {
+        size_t baseN = ids.size();
         size_t k = static_cast<size_t>(commit);
+        bool appendOpen = includeOpenToken && hasOpen && baseN < k;
+        size_t n = baseN + (appendOpen ? 1 : 0);
 
         std::vector<int64_t> hypIds(k, ctx.pcecPadIn);
         std::vector<int64_t> pauseArr(k, ctx.pcecPauseBlackout);
         std::vector<float> acArr(wantsAcoustic ? k * static_cast<size_t>(hiddenDim) : 0, 0.0f);
         std::vector<float> keepArr(wantsKeep ? k : 0, 0.0f);
 
-        for (size_t i = 0; i < n; ++i) {
+        for (size_t i = 0; i < baseN; ++i) {
             hypIds[i] = ids[i];
             if (ctx.pcecRealPause) pauseArr[i] = pause[i];
             if (wantsAcoustic && hiddenDim > 0) {
@@ -961,6 +1001,17 @@ struct PcecState {
                     acoustic.begin() + (i + 1) * static_cast<size_t>(hiddenDim),
                     acArr.begin() + i * static_cast<size_t>(hiddenDim)
                 );
+            }
+        }
+        if (appendOpen) {
+            hypIds[baseN] = openTok;
+            if (ctx.pcecRealPause) pauseArr[baseN] = pauseBucket(openBlanks);
+            if (wantsAcoustic && hiddenDim > 0) {
+                double inv = 1.0 / static_cast<double>(std::max<int64_t>(1, openCount));
+                for (int64_t d = 0; d < hiddenDim; ++d) {
+                    acArr[baseN * static_cast<size_t>(hiddenDim) + static_cast<size_t>(d)] =
+                        static_cast<float>(openAcc[static_cast<size_t>(d)] * inv);
+                }
             }
         }
 
@@ -993,10 +1044,12 @@ struct PcecState {
             inNames.push_back(keepName.c_str());
             inVals.push_back(Ort::Value::CreateTensor<float>(memInfo, keepArr.data(), keepArr.size(), shape2d, 2));
         }
+        TensorBuffer stateCopy = stateBuf;
+        TensorBuffer seenCopy = seenBuf;
         inNames.push_back(stateName.c_str());
-        inVals.push_back(stateBuf.asOrtValue(memInfo));
+        inVals.push_back(stateCopy.asOrtValue(memInfo));
         inNames.push_back(seenName.c_str());
-        inVals.push_back(seenBuf.asOrtValue(memInfo));
+        inVals.push_back(seenCopy.asOrtValue(memInfo));
 
         // Read n_real shape from flush session (scalar [] or [1])
         const auto& nRealDesc = flushSess.inputs.at(flushSess.inputByName.at(nRealName));
@@ -1018,6 +1071,18 @@ struct PcecState {
             result.push_back(tailSlots[static_cast<size_t>(i)]);
         }
         return result;
+    }
+
+    std::string renderPreview(const Ort::MemoryInfo& memInfo, const Ort::RunOptions& runOpts) const {
+        if (slots.empty() && ids.empty() && !hasOpen) {
+            return "";
+        }
+        std::vector<int64_t> previewSlots = slots;
+        if (!ids.empty() || hasOpen) {
+            std::vector<int64_t> tailSlots = tail(memInfo, runOpts, /*includeOpenToken=*/true);
+            previewSlots.insert(previewSlots.end(), tailSlots.begin(), tailSlots.end());
+        }
+        return renderPcecSlots(ctx, previewSlots);
     }
 };
 
@@ -1086,7 +1151,11 @@ Asr4allContext* asr4all_init(const char* bundle_dir, int n_threads, char* err_bu
 
         if (const JsonValue* graphs = meta.get("graphs"); graphs && graphs->isObject()) {
             for (const auto& kv : graphs->objVal) {
-                ctx->graphFiles[kv.first] = kv.second.asString();
+                std::string rel = kv.second.asString();
+                if (!isSafeRelativeBundlePath(rel)) {
+                    throw std::runtime_error("Unsafe graph filename in metadata.json: " + rel);
+                }
+                ctx->graphFiles[kv.first] = std::move(rel);
             }
         }
 
@@ -1129,7 +1198,11 @@ Asr4allContext* asr4all_init(const char* bundle_dir, int n_threads, char* err_bu
         }
 
         if (const JsonValue* weights = meta.get("weights"); weights && weights->isString()) {
-            std::string weightsPath = ctx->bundleDir + "/" + weights->asString();
+            std::string relWeights = weights->asString();
+            if (!isSafeRelativeBundlePath(relWeights)) {
+                throw std::runtime_error("Unsafe weights filename in metadata.json: " + relWeights);
+            }
+            std::string weightsPath = ctx->bundleDir + "/" + relWeights;
             int fd = open(weightsPath.c_str(), O_RDONLY);
             if (fd < 0) {
                 throw std::runtime_error("Failed to open weights file: " + weightsPath + " (" + std::strerror(errno) + ")");
@@ -1178,6 +1251,325 @@ void asr4all_reset_abort(Asr4allContext* ctx) {
     }
 }
 
+} // extern "C"
+
+struct Asr4allStream {
+    Asr4allContext* ctx = nullptr;
+    TierInfo tier;
+    LoadedSession* streamSess = nullptr;
+    TensorBuffer filterCache;
+    TensorBuffer attnCache;
+    std::unique_ptr<PcecState> pcec;
+    std::vector<float> pendingPcm;
+    std::vector<int64_t> allIds;
+    std::vector<float> win;
+    std::string pcmName;
+    std::string lpOutName;
+    std::string fcOutName;
+    std::string acOutName;
+    std::string hidOutName;
+    std::string lastPreview;
+    bool finished = false;
+
+    Asr4allStream(Asr4allContext* context, const std::string& selectedTier, bool applyPcec)
+        : ctx(context),
+          tier(context->getTierInfo(selectedTier)),
+          streamSess(&context->getOrLoadSession(tier.name)) {
+        const auto& filterDesc = streamSess->inputs.at(streamSess->inputByName.at("filter_cache"));
+        const auto& attnDesc = streamSess->inputs.at(streamSess->inputByName.at("attn_cache"));
+        filterCache = TensorBuffer::zeros(filterDesc);
+        attnCache = TensorBuffer::zeros(attnDesc);
+
+        if (applyPcec && ctx->hasPcec && tier.hasHidden && !tier.pcecRungKey.empty()) {
+            auto rIt = ctx->pcecRungs.find(tier.pcecRungKey);
+            if (rIt != ctx->pcecRungs.end()) {
+                pcec = std::make_unique<PcecState>(*ctx, rIt->second, tier.hiddenDim);
+            }
+        }
+
+        win.assign(static_cast<size_t>(tier.windowSamples), 0.0f);
+        pcmName = tier.name + "_pcm";
+        lpOutName = tier.name + "_log_probs";
+        fcOutName = tier.name + "_filter_cache_out";
+        acOutName = tier.name + "_attn_cache_out";
+        hidOutName = tier.name + "_hidden";
+    }
+
+    void runChunk(const float* windowPtr, size_t validFrames) {
+        int64_t winShape[2] = {1, tier.windowSamples};
+        const char* inNames[3] = {pcmName.c_str(), "filter_cache", "attn_cache"};
+        Ort::Value inVals[3] = {
+            Ort::Value::CreateTensor<float>(ctx->memInfo, const_cast<float*>(windowPtr), static_cast<size_t>(tier.windowSamples), winShape, 2),
+            filterCache.asOrtValue(ctx->memInfo),
+            attnCache.asOrtValue(ctx->memInfo)
+        };
+
+        std::vector<const char*> outNames = {lpOutName.c_str(), fcOutName.c_str(), acOutName.c_str()};
+        if (pcec) {
+            outNames.push_back(hidOutName.c_str());
+        }
+
+        auto outs = streamSess->session->Run(
+            ctx->runOptions,
+            inNames,
+            inVals,
+            3,
+            outNames.data(),
+            outNames.size()
+        );
+
+        copyOrtValueToBuffer(outs[1], filterCache);
+        copyOrtValueToBuffer(outs[2], attnCache);
+
+        auto lpInfo = outs[0].GetTensorTypeAndShapeInfo();
+        auto lpShape = lpInfo.GetShape();
+        size_t vocabSize = static_cast<size_t>(lpShape.at(2));
+        const float* lpData = outs[0].GetTensorData<float>();
+
+        std::vector<int64_t> chunkIds(validFrames);
+        for (size_t f = 0; f < validFrames; ++f) {
+            const float* row = lpData + f * vocabSize;
+            size_t bestIdx = 0;
+            float bestVal = row[0];
+            for (size_t v = 1; v < vocabSize; ++v) {
+                if (row[v] > bestVal) {
+                    bestVal = row[v];
+                    bestIdx = v;
+                }
+            }
+            chunkIds[f] = static_cast<int64_t>(bestIdx);
+        }
+
+        if (pcec && outs.size() > 3 && validFrames > 0) {
+            const float* hidData = outs[3].GetTensorData<float>();
+            pcec->pool(chunkIds, hidData, validFrames);
+            pcec->drain(ctx->memInfo, ctx->runOptions);
+        } else {
+            allIds.insert(allIds.end(), chunkIds.begin(), chunkIds.end());
+        }
+    }
+
+    bool feed(const float* samples, size_t nSamples) {
+        if (samples && nSamples > 0) {
+            pendingPcm.insert(pendingPcm.end(), samples, samples + nSamples);
+        }
+        bool ranChunk = false;
+        size_t winSamples = static_cast<size_t>(tier.windowSamples);
+        size_t commitSamples = static_cast<size_t>(tier.commitFrames) * static_cast<size_t>(ctx->samplesPerFrame);
+        size_t offset = 0;
+
+        // Drop samples whose chunk already advanced the caches on every exit path (normal, abort, or a throw
+        // from a later runChunk), so a resumed stream never re-feeds audio into already-updated state.
+        auto consume = [&]() {
+            if (offset > 0) {
+                pendingPcm.erase(pendingPcm.begin(), pendingPcm.begin() + static_cast<std::ptrdiff_t>(offset));
+                offset = 0;
+            }
+        };
+        try {
+            while (pendingPcm.size() - offset >= winSamples) {
+                if (ctx->aborted.load(std::memory_order_acquire)) {
+                    break;
+                }
+                runChunk(pendingPcm.data() + offset, static_cast<size_t>(tier.commitFrames));
+                offset += commitSamples;
+                ranChunk = true;
+            }
+        } catch (...) {
+            consume();
+            throw;
+        }
+        consume();
+        return ranChunk;
+    }
+
+    std::string currentPreview() {
+        if (pcec) {
+            lastPreview = pcec->renderPreview(ctx->memInfo, ctx->runOptions);
+        } else {
+            lastPreview = collapseCtcPlain(*ctx, allIds);
+        }
+        return lastPreview;
+    }
+
+    std::string finish() {
+        if (finished) return lastPreview;
+        finished = true;
+
+        if (!pendingPcm.empty()) {
+            size_t spf = static_cast<size_t>(ctx->samplesPerFrame);
+            size_t paddedLen = ((pendingPcm.size() + spf - 1) / spf) * spf;
+            if (paddedLen > pendingPcm.size()) {
+                pendingPcm.resize(paddedLen, 0.0f);
+            }
+            size_t totalFrames = paddedLen / spf;
+            size_t commitFrames = static_cast<size_t>(tier.commitFrames);
+            size_t commitSamples = commitFrames * spf;
+            size_t offset = 0;
+
+            while (offset < paddedLen) {
+                if (ctx->aborted.load(std::memory_order_acquire)) {
+                    return "";
+                }
+                std::fill(win.begin(), win.end(), 0.0f);
+                size_t copyCount = std::min(win.size(), paddedLen - offset);
+                std::memcpy(win.data(), pendingPcm.data() + offset, copyCount * sizeof(float));
+                size_t remFrames = totalFrames - (offset / spf);
+                size_t valid = std::min(commitFrames, remFrames);
+                runChunk(win.data(), valid);
+                offset += commitSamples;
+            }
+            pendingPcm.clear();
+        }
+
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            return "";
+        }
+
+        if (pcec) {
+            pcec->flushOpen();
+            pcec->drain(ctx->memInfo, ctx->runOptions);
+            std::vector<int64_t> allSlots = std::move(pcec->slots);
+            std::vector<int64_t> tailSlots = pcec->tail(ctx->memInfo, ctx->runOptions, /*includeOpenToken=*/false);
+            allSlots.insert(allSlots.end(), tailSlots.begin(), tailSlots.end());
+            lastPreview = renderPcecSlots(*ctx, allSlots);
+        } else {
+            lastPreview = collapseCtcPlain(*ctx, allIds);
+        }
+        return lastPreview;
+    }
+};
+
+namespace {
+int allocateOutText(const std::string& text, char** out_text, char* err_buf, size_t err_buf_len) {
+    char* dup = static_cast<char*>(std::malloc(text.size() + 1));
+    if (!dup) {
+        writeErr(err_buf, err_buf_len, "Out of memory allocating transcript string");
+        return -1;
+    }
+    std::memcpy(dup, text.c_str(), text.size() + 1);
+    *out_text = dup;
+    return 0;
+}
+} // namespace
+
+extern "C" {
+
+void asr4all_atomic_store_i32(int32_t* target, int32_t value) {
+    if (!target) return;
+    __atomic_store_n(target, value, __ATOMIC_SEQ_CST);
+}
+
+int32_t asr4all_atomic_load_i32(const int32_t* target) {
+    if (!target) return 0;
+    return __atomic_load_n(target, __ATOMIC_SEQ_CST);
+}
+
+Asr4allStream* asr4all_stream_begin(
+    Asr4allContext* ctx,
+    const char* tier_name,
+    bool apply_pcec,
+    char* err_buf,
+    size_t err_buf_len
+) {
+    if (!ctx) {
+        writeErr(err_buf, err_buf_len, "Invalid context in asr4all_stream_begin");
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->aborted.load(std::memory_order_acquire)) {
+        writeErr(err_buf, err_buf_len, "Transcription aborted");
+        return nullptr;
+    }
+    try {
+        std::string selectedTier = (tier_name && *tier_name) ? std::string(tier_name) : ctx->defaultTier;
+        return new Asr4allStream(ctx, selectedTier, apply_pcec);
+    } catch (const std::exception& e) {
+        writeErr(err_buf, err_buf_len, e.what());
+        return nullptr;
+    }
+}
+
+int asr4all_stream_step(
+    Asr4allStream* stream,
+    const float* new_samples,
+    size_t n_samples,
+    char** out_text,
+    int* out_window_samples,
+    char* err_buf,
+    size_t err_buf_len
+) {
+    if (!stream || !stream->ctx || !out_text) {
+        writeErr(err_buf, err_buf_len, "Invalid argument to asr4all_stream_step");
+        return -1;
+    }
+    *out_text = nullptr;
+    Asr4allContext* ctx = stream->ctx;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->aborted.load(std::memory_order_acquire)) {
+        return -2;
+    }
+    if (out_window_samples) {
+        *out_window_samples = static_cast<int>(stream->tier.windowSamples);
+    }
+    try {
+        bool ran = stream->feed(new_samples, n_samples);
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            return -2;
+        }
+        const std::string& text = ran ? stream->currentPreview() : stream->lastPreview;
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            return -2;
+        }
+        return allocateOutText(text, out_text, err_buf, err_buf_len);
+    } catch (const std::exception& e) {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            return -2;
+        }
+        writeErr(err_buf, err_buf_len, e.what());
+        return -1;
+    }
+}
+
+int asr4all_stream_finish(
+    Asr4allStream* stream,
+    char** out_text,
+    int* out_window_samples,
+    char* err_buf,
+    size_t err_buf_len
+) {
+    if (!stream || !stream->ctx || !out_text) {
+        writeErr(err_buf, err_buf_len, "Invalid argument to asr4all_stream_finish");
+        return -1;
+    }
+    *out_text = nullptr;
+    Asr4allContext* ctx = stream->ctx;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->aborted.load(std::memory_order_acquire)) {
+        return -2;
+    }
+    if (out_window_samples) {
+        *out_window_samples = static_cast<int>(stream->tier.windowSamples);
+    }
+    try {
+        std::string finalText = stream->finish();
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            return -2;
+        }
+        return allocateOutText(finalText, out_text, err_buf, err_buf_len);
+    } catch (const std::exception& e) {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            return -2;
+        }
+        writeErr(err_buf, err_buf_len, e.what());
+        return -1;
+    }
+}
+
+void asr4all_stream_free(Asr4allStream* stream) {
+    delete stream;
+}
+
 int asr4all_transcribe(
     Asr4allContext* ctx,
     const float* samples,
@@ -1206,150 +1598,19 @@ int asr4all_transcribe(
 
     try {
         std::string selectedTier = (tier_name && *tier_name) ? std::string(tier_name) : ctx->defaultTier;
-        const TierInfo& tier = ctx->getTierInfo(selectedTier);
-        LoadedSession& streamSess = ctx->getOrLoadSession(tier.name);
-
+        Asr4allStream stream(ctx, selectedTier, apply_pcec);
         if (out_window_samples) {
-            *out_window_samples = static_cast<int>(tier.windowSamples);
+            *out_window_samples = static_cast<int>(stream.tier.windowSamples);
         }
-
-        const auto& filterDesc = streamSess.inputs.at(streamSess.inputByName.at("filter_cache"));
-        const auto& attnDesc = streamSess.inputs.at(streamSess.inputByName.at("attn_cache"));
-        TensorBuffer filterCache = TensorBuffer::zeros(filterDesc);
-        TensorBuffer attnCache = TensorBuffer::zeros(attnDesc);
-
-        std::unique_ptr<PcecState> pcec;
-        if (apply_pcec && ctx->hasPcec && tier.hasHidden && !tier.pcecRungKey.empty()) {
-            auto rIt = ctx->pcecRungs.find(tier.pcecRungKey);
-            if (rIt != ctx->pcecRungs.end()) {
-                pcec = std::make_unique<PcecState>(*ctx, rIt->second, tier.hiddenDim);
-            }
-        }
-
-        // Pad PCM to a multiple of samplesPerFrame so trailing <40ms audio is never dropped
-        size_t spf = static_cast<size_t>(ctx->samplesPerFrame);
-        size_t paddedLen = ((n_samples + spf - 1) / spf) * spf;
-        std::vector<float> pcm(paddedLen, 0.0f);
-        std::memcpy(pcm.data(), samples, n_samples * sizeof(float));
-
-        size_t totalFrames = paddedLen / spf;
-        size_t nextFrame = 0;
-        std::vector<int64_t> allIds;
-        std::vector<float> win(static_cast<size_t>(tier.windowSamples), 0.0f);
-
-        std::string pcmName = tier.name + "_pcm";
-        std::string lpOutName = tier.name + "_log_probs";
-        std::string fcOutName = tier.name + "_filter_cache_out";
-        std::string acOutName = tier.name + "_attn_cache_out";
-        std::string hidOutName = tier.name + "_hidden";
-
-        auto copyCacheOut = [](const Ort::Value& src, TensorBuffer& dst) {
-            auto info = src.GetTensorTypeAndShapeInfo();
-            dst.shape = info.GetShape();
-            dst.elemType = info.GetElementType();
-            size_t bytes = info.GetElementCount() * sizeof(float);
-            if (dst.elemType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) bytes = info.GetElementCount() * 2;
-            dst.raw.resize(bytes);
-            if (bytes > 0) std::memcpy(dst.raw.data(), src.GetTensorRawData(), bytes);
-        };
-
-        while (nextFrame * spf < pcm.size()) {
-            if (ctx->aborted.load(std::memory_order_acquire)) {
-                return -2;
-            }
-
-            size_t startSample = nextFrame * spf;
-            std::fill(win.begin(), win.end(), 0.0f);
-            size_t hi = std::min(pcm.size(), startSample + static_cast<size_t>(tier.windowSamples));
-            if (hi > startSample) {
-                std::memcpy(win.data(), pcm.data() + startSample, (hi - startSample) * sizeof(float));
-            }
-
-            int64_t winShape[2] = {1, tier.windowSamples};
-            const char* inNames[3] = {pcmName.c_str(), "filter_cache", "attn_cache"};
-            Ort::Value inVals[3] = {
-                Ort::Value::CreateTensor<float>(ctx->memInfo, win.data(), win.size(), winShape, 2),
-                filterCache.asOrtValue(ctx->memInfo),
-                attnCache.asOrtValue(ctx->memInfo)
-            };
-
-            std::vector<const char*> outNames = {lpOutName.c_str(), fcOutName.c_str(), acOutName.c_str()};
-            if (pcec) {
-                outNames.push_back(hidOutName.c_str());
-            }
-
-            auto outs = streamSess.session->Run(
-                ctx->runOptions,
-                inNames,
-                inVals,
-                3,
-                outNames.data(),
-                outNames.size()
-            );
-
-            copyCacheOut(outs[1], filterCache);
-            copyCacheOut(outs[2], attnCache);
-
-            size_t valid = std::min<size_t>(static_cast<size_t>(tier.commitFrames), totalFrames - nextFrame);
-            auto lpInfo = outs[0].GetTensorTypeAndShapeInfo();
-            auto lpShape = lpInfo.GetShape();
-            size_t vocabSize = static_cast<size_t>(lpShape.at(2));
-            const float* lpData = outs[0].GetTensorData<float>();
-
-            std::vector<int64_t> chunkIds(valid);
-            for (size_t f = 0; f < valid; ++f) {
-                const float* row = lpData + f * vocabSize;
-                size_t bestIdx = 0;
-                float bestVal = row[0];
-                for (size_t v = 1; v < vocabSize; ++v) {
-                    if (row[v] > bestVal) {
-                        bestVal = row[v];
-                        bestIdx = v;
-                    }
-                }
-                chunkIds[f] = static_cast<int64_t>(bestIdx);
-            }
-
-            allIds.insert(allIds.end(), chunkIds.begin(), chunkIds.end());
-            if (pcec && outs.size() > 3 && valid > 0) {
-                const float* hidData = outs[3].GetTensorData<float>();
-                pcec->pool(chunkIds, hidData, valid);
-                pcec->drain(ctx->memInfo, ctx->runOptions);
-            }
-
-            nextFrame += static_cast<size_t>(tier.commitFrames);
-        }
-
+        stream.feed(samples, n_samples);
         if (ctx->aborted.load(std::memory_order_acquire)) {
             return -2;
         }
-
-        std::string finalText;
-        if (pcec) {
-            pcec->flushOpen();
-            pcec->drain(ctx->memInfo, ctx->runOptions);
-            std::vector<int64_t> allSlots = std::move(pcec->slots);
-            std::vector<int64_t> tailSlots = pcec->tail(ctx->memInfo, ctx->runOptions);
-            allSlots.insert(allSlots.end(), tailSlots.begin(), tailSlots.end());
-            finalText = renderPcecSlots(*ctx, allSlots);
-        } else {
-            finalText = collapseCtcPlain(*ctx, allIds);
-        }
-
-        char* dup = static_cast<char*>(std::malloc(finalText.size() + 1));
-        if (!dup) {
-            writeErr(err_buf, err_buf_len, "Out of memory allocating transcript string");
-            return -1;
-        }
-        std::memcpy(dup, finalText.c_str(), finalText.size() + 1);
-        *out_text = dup;
-        return 0;
-    } catch (const Ort::Exception& e) {
+        std::string finalText = stream.finish();
         if (ctx->aborted.load(std::memory_order_acquire)) {
             return -2;
         }
-        writeErr(err_buf, err_buf_len, e.what());
-        return -1;
+        return allocateOutText(finalText, out_text, err_buf, err_buf_len);
     } catch (const std::exception& e) {
         if (ctx->aborted.load(std::memory_order_acquire)) {
             return -2;

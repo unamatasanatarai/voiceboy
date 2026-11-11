@@ -50,7 +50,9 @@ struct VoiceBoyTests {
         testContextReinitializationAfterAbort()
         testInFlightChunkAbortionOnStop()
         testAsr4allModelsCatalogAndInference()
-        
+        testSecurityAndConcurrencyHardening()
+        testHostileReviewFixes()
+
         print("\n--------------------------------------------------")
         print("Test Summary: \(passed) passed, \(failed) failed")
         print("--------------------------------------------------\n")
@@ -892,6 +894,7 @@ struct VoiceBoyTests {
             guard let m = model else { continue }
             
             assert(m.engine == .asr4all, "\(name) uses .asr4all engine")
+            assert(m.displayName.contains("English"), "\(name) displayName clearly indicates English")
             assert(!m.bundleFiles.isEmpty, "\(name) defines bundleFiles")
             assert(AudioTranscriber.isEnglishOnlyModel(name), "\(name) is marked English-only")
             
@@ -976,6 +979,332 @@ struct VoiceBoyTests {
         } else {
             print("⚠️ Skipping live ASR4ALL inference (model or jfk.wav not present locally)")
         }
+    }
+    
+    // MARK: - Hostile Review Hardening Regression Tests (F-01 through F-07)
+    static func testSecurityAndConcurrencyHardening() {
+        print("\n[Security & Concurrency] Testing F-01..F-07 Regression Suite...")
+        
+        // F-01: Generational token prevents stale abort reset race
+        let g1 = AudioTranscriber.shared.abortAndAdvanceGeneration()
+        let g2 = AudioTranscriber.shared.abortAndAdvanceGeneration()
+        assert(g2 > g1, "abortAndAdvanceGeneration strictly increments token")
+        assert(!AudioTranscriber.shared.resetAbort(ifMatchingGeneration: g1), "Stale generation cannot clear abort")
+        assert(AudioTranscriber.shared.isAborted, "Abort remains set after stale reset attempt")
+        assert(AudioTranscriber.shared.resetAbort(ifMatchingGeneration: g2), "Current generation clears abort cleanly")
+        assert(!AudioTranscriber.shared.isAborted, "Abort is cleared after matching generation reset")
+        
+        // F-01: Passing stale generation to transcribe() self-rejects inside queue.sync
+        let dummySamples = [Float](repeating: 0.05, count: 16000)
+        let dummyAudio = AudioData(samples: dummySamples, originalDurationSec: 1.0, trimmedDurationSec: 1.0, sampleRate: 16000)
+        var rejectedStale = false
+        do {
+            _ = try AudioTranscriber.shared.transcribe(audioData: dummyAudio, expectedGeneration: g1)
+        } catch TranscriberError.transcriptionCancelled {
+            rejectedStale = true
+        } catch {
+            // Even if no model or wrong state, expectedGeneration must trigger transcriptionCancelled first
+        }
+        assert(rejectedStale, "transcribe() rejects stale generation token immediately with transcriptionCancelled")
+        AudioTranscriber.shared.resetAbort()
+        
+        // F-02: Oversized stereo buffer (32768 frames > 16384 monoMix capacity) converts safely in bounded chunks
+        if let stereo48k = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false),
+           let mono48k = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false),
+           let target16k = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+           let converter = AVAudioConverter(from: mono48k, to: target16k),
+           let bigInput = AVAudioPCMBuffer(pcmFormat: stereo48k, frameCapacity: 32768),
+           let monoMix = AVAudioPCMBuffer(pcmFormat: mono48k, frameCapacity: 16384),
+           let outBuf = AVAudioPCMBuffer(pcmFormat: target16k, frameCapacity: 16384) {
+            bigInput.frameLength = 32768
+            if let ch = bigInput.floatChannelData {
+                for i in 0..<32768 {
+                    ch[0][i] = 0.5
+                    ch[1][i] = -0.1
+                }
+            }
+            let ring = RealtimeAudioRingBuffer(capacity: 65536)
+            LiveAudioStreamer.processTapBuffer(
+                bigInput,
+                monoMixBuffer: monoMix,
+                converter: converter,
+                conversionBuffer: outBuf,
+                ringBuffer: ring
+            )
+            var drained: [Float] = []
+            ring.drain(into: &drained)
+            assert(drained.count > 9000 && drained.count <= 12000, "Oversized 32768 stereo 48kHz buffer downmixed & resampled cleanly without overflow (got \(drained.count) samples)")
+        } else {
+            assert(false, "Could not allocate AVAudioPCMBuffer test formats")
+        }
+        
+        // F-04: Path traversal & external tensor overflow rejection in asr4all C++ loader
+        let evilBundleDir = FileManager.default.temporaryDirectory.appendingPathComponent("voiceboy-evil-\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: evilBundleDir, withIntermediateDirectories: true)
+            let evilMeta = """
+            {
+              "sample_rate": 16000,
+              "vocab": ["<blk>", "a"],
+              "graphs": {
+                "stream_c16r4": {
+                  "path": "../../etc/passwd",
+                  "context_frames": 16,
+                  "step_frames": 4,
+                  "hop_samples": 160,
+                  "window_samples": 12800
+                }
+              },
+              "weights": {
+                "asr4all.onnx.data": { "offset": "18446744073709551600", "length": "32" }
+              }
+            }
+            """
+            try Data(evilMeta.utf8).write(to: evilBundleDir.appendingPathComponent("metadata.json"))
+            try Data(repeating: 0, count: 16).write(to: evilBundleDir.appendingPathComponent("asr4all.onnx.data"))
+            var errBuf = [CChar](repeating: 0, count: 512)
+            let evilCtx = asr4all_init(evilBundleDir.path, 1, &errBuf, errBuf.count)
+            assert(evilCtx == nil, "asr4all_init rejects path traversal and overflow metadata cleanly")
+            if let ctx = evilCtx { asr4all_free(ctx) }
+        } catch {
+            assert(false, "Failed writing temporary test bundle: \(error)")
+        }
+        try? FileManager.default.removeItem(at: evilBundleDir)
+        
+        // F-04: Integrity check rejects tampered known model dir named "asr4all-s"
+        let fakeKnownDir = FileManager.default.temporaryDirectory.appendingPathComponent("voiceboy-fake-\(UUID().uuidString)/asr4all-s")
+        do {
+            try FileManager.default.createDirectory(at: fakeKnownDir, withIntermediateDirectories: true)
+            try Data("{}".utf8).write(to: fakeKnownDir.appendingPathComponent("metadata.json"))
+            try Data("bad".utf8).write(to: fakeKnownDir.appendingPathComponent("asr4all.onnx.data"))
+            let check = AudioTranscriber.verifyKnownModelIntegrityIfMatched(at: fakeKnownDir.path)
+            assert(!check.isValid, "verifyKnownModelIntegrityIfMatched rejects tampered asr4all-s bundle")
+        } catch {
+            assert(false, "Failed setting up fake known model dir: \(error)")
+        }
+        try? FileManager.default.removeItem(at: fakeKnownDir.deletingLastPathComponent())
+        
+        // F-03: Incremental stateful ONNX stream equivalence on jfk.wav
+        let jfkPath = FileManager.default.currentDirectoryPath + "/deps/whisper.cpp/samples/jfk.wav"
+        let smallPath = AudioTranscriber.xdgModelsDirectory.appendingPathComponent("asr4all-s").path
+        if let smallModel = AudioTranscriber.knownModels.first(where: { $0.filename == "asr4all-s" }),
+           AudioTranscriber.isModelInstalled(smallModel, at: smallPath),
+           let wavData = try? Data(contentsOf: URL(fileURLWithPath: jfkPath)) {
+            var offset = 12
+            var samples: [Float] = []
+            while offset + 8 <= wavData.count {
+                let chunkID = String(data: wavData.subdata(in: offset..<(offset + 4)), encoding: .ascii)
+                let chunkSize = wavData.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
+                    Int($0.load(as: UInt32.self).littleEndian)
+                }
+                offset += 8
+                if chunkID == "data" && offset + chunkSize <= wavData.count {
+                    let count = chunkSize / 2
+                    samples.reserveCapacity(count)
+                    wavData.withUnsafeBytes { raw in
+                        let ptr = raw.baseAddress!.advanced(by: offset).assumingMemoryBound(to: Int16.self)
+                        for i in 0..<count {
+                            samples.append(Float(Int16(littleEndian: ptr[i])) / 32768.0)
+                        }
+                    }
+                    break
+                }
+                offset += chunkSize
+            }
+            if !samples.isEmpty {
+                do {
+                    let gen = AudioTranscriber.shared.abortAndAdvanceGeneration()
+                    _ = AudioTranscriber.shared.resetAbort(ifMatchingGeneration: gen)
+                    var fed = 0
+                    let stepSize = 11200 // 0.7s live ticks
+                    var isFirst = true
+                    while fed + stepSize <= samples.count {
+                        let targetEnd = fed + stepSize
+                        let (previewText, _) = try AudioTranscriber.shared.stepAsr4allStream(
+                            modelPath: smallPath,
+                            tierName: "stream_c16r4",
+                            restartStream: isFirst,
+                            expectedGeneration: gen,
+                            sampleSliceProvider: { startOffset in
+                                fed = targetEnd
+                                return Array(samples[startOffset..<targetEnd])
+                            }
+                        )
+                        isFirst = false
+                        _ = previewText
+                    }
+                    let finalRes = try AudioTranscriber.shared.finishAsr4allStream(
+                        modelPath: smallPath,
+                        tierName: "stream_c16r4",
+                        originalDurationSec: Double(samples.count) / 16000.0,
+                        trimmedDurationSec: Double(samples.count) / 16000.0,
+                        expectedGeneration: gen,
+                        sampleSliceProvider: { startOffset in
+                            guard startOffset < samples.count else { return [] }
+                            return Array(samples[startOffset..<samples.count])
+                        }
+                    )
+                    print("Incremental ASR4ALL-S stream transcription: \(finalRes.text)")
+                    let lower = finalRes.text.lowercased()
+                    assert(lower.contains("fellow america") && lower.contains("country can do for you"), "Incremental stateful ASR4ALL stream matches batch accuracy")
+                } catch {
+                    assert(false, "Incremental ASR4ALL stream test failed: \(error)")
+                }
+            }
+        }
+        
+        // F-05: Redirect URL allowlist checks
+        assert(ModelDownloadManager.isRedirectURLAllowed(URL(string: "https://cas-bridge.xethub.hf.co/blob/abc")!), "HF CAS HTTPS redirect is allowed")
+        assert(ModelDownloadManager.isRedirectURLAllowed(URL(string: "https://cdn-lfs-us-1.huggingface.co/repos/abc")!), "HF LFS HTTPS redirect is allowed")
+        assert(!ModelDownloadManager.isRedirectURLAllowed(URL(string: "http://huggingface.co/futo-org/asr4all-s")!), "Downgrade to HTTP redirect is rejected")
+        assert(!ModelDownloadManager.isRedirectURLAllowed(URL(string: "https://attacker.example.com/model.bin")!), "Untrusted redirect host is rejected")
+        
+        // F-07: Secure input check and non-AX clipboard preservation when copyToClipboard == false
+        _ = TextPaster.isTargetSecureInput()
+        assert(true, "TextPaster.isTargetSecureInput completes safely without AX permission")
+        if !AXIsProcessTrusted() {
+            let pb = NSPasteboard.general
+            let sentinel = "voiceboy-clipboard-sentinel-\(UUID().uuidString)"
+            pb.clearContents()
+            pb.setString(sentinel, forType: .string)
+            TextPaster.resetDebounceForTesting()
+            TextPaster.paste(text: "Should not touch clipboard without AX", copyToClipboard: false)
+            assert(pb.string(forType: .string) == sentinel, "Clipboard is untouched when copyToClipboard is false without AX trust")
+        }
+    }
+
+    // MARK: - Hostile review fixes (F1–F5)
+    static func loadJfkSamples() -> [Float]? {
+        let jfkPath = FileManager.default.currentDirectoryPath + "/deps/whisper.cpp/samples/jfk.wav"
+        guard let d = try? Data(contentsOf: URL(fileURLWithPath: jfkPath)) else { return nil }
+        var off = 12
+        var out: [Float] = []
+        while off + 8 <= d.count {
+            let id = String(data: d.subdata(in: off..<(off + 4)), encoding: .ascii)
+            let sz = d.subdata(in: (off + 4)..<(off + 8)).withUnsafeBytes { Int($0.load(as: UInt32.self).littleEndian) }
+            off += 8
+            if id == "data" && off + sz <= d.count {
+                d.withUnsafeBytes { raw in
+                    let p = raw.baseAddress!.advanced(by: off).assumingMemoryBound(to: Int16.self)
+                    for i in 0..<(sz / 2) { out.append(Float(Int16(littleEndian: p[i])) / 32768.0) }
+                }
+                break
+            }
+            off += sz
+        }
+        return out.isEmpty ? nil : out
+    }
+
+    static func testHostileReviewFixes() {
+        print("\n[Hostile Review] Testing F1–F5 fixes...")
+
+        // F1: an ASR4ALL live preview never covers the engine's unprocessed tail, so stop must always run finish().
+        assert(!AppState.shouldPasteLivePreviewOnStop(enableFinalizing: false, usingIncrementalAsr4allStream: true,
+                                                      totalSamples: 16000, lastTranscribedSampleCount: 16000, liveText: "hello"),
+               "F1: ASR4ALL stream session never pastes the un-flushed live preview")
+        assert(AppState.shouldPasteLivePreviewOnStop(enableFinalizing: false, usingIncrementalAsr4allStream: false,
+                                                     totalSamples: 16000, lastTranscribedSampleCount: 16000, liveText: "hello"),
+               "F1: Whisper session still pastes live text when it covers all audio")
+        assert(!AppState.shouldPasteLivePreviewOnStop(enableFinalizing: true, usingIncrementalAsr4allStream: false,
+                                                      totalSamples: 16000, lastTranscribedSampleCount: 16000, liveText: "hello"),
+               "F1: Finalizing ON never takes the live-paste shortcut")
+        assert(!AppState.shouldPasteLivePreviewOnStop(enableFinalizing: false, usingIncrementalAsr4allStream: false,
+                                                      totalSamples: 32000, lastTranscribedSampleCount: 16000, liveText: "hello"),
+               "F1: Live text that misses trailing audio is not pasted")
+
+        // F2: advancing the generation for stop must not abort, must reject stale queued steps,
+        // and must keep the incremental stream so finish() only feeds the tail.
+        let t = AudioTranscriber.shared
+        let smallPath = AudioTranscriber.xdgModelsDirectory.appendingPathComponent("asr4all-s").path
+        if let smallModel = AudioTranscriber.knownModels.first(where: { $0.filename == "asr4all-s" }),
+           AudioTranscriber.isModelInstalled(smallModel, at: smallPath),
+           let samples = loadJfkSamples() {
+            let gen1 = t.abortAndAdvanceGeneration()
+            _ = t.resetAbort(ifMatchingGeneration: gen1)
+            var fed = 0
+            do {
+                var first = true
+                while fed + 11200 <= samples.count {
+                    let end = fed + 11200
+                    _ = try t.stepAsr4allStream(modelPath: smallPath, restartStream: first, expectedGeneration: gen1,
+                                                sampleSliceProvider: { s in fed = end; return Array(samples[s..<end]) })
+                    first = false
+                }
+            } catch {
+                assert(false, "F2: live steps failed: \(error)")
+            }
+            let gen2 = t.advanceGenerationWithoutAbort()
+            assert(gen2 > gen1, "F2: advanceGenerationWithoutAbort increments generation")
+            assert(!t.isAborted, "F2: advanceGenerationWithoutAbort does not set the abort flag")
+            var staleRejected = false
+            do {
+                _ = try t.stepAsr4allStream(modelPath: smallPath, restartStream: false, expectedGeneration: gen1,
+                                            sampleSliceProvider: { _ in [] })
+            } catch TranscriberError.transcriptionCancelled {
+                staleRejected = true
+            } catch {}
+            assert(staleRejected, "F2: queued step with stale generation is rejected after stop")
+            var finishFromOffset = -1
+            do {
+                let res = try t.finishAsr4allStream(modelPath: smallPath, originalDurationSec: 11, trimmedDurationSec: 11,
+                                                    expectedGeneration: gen2,
+                                                    sampleSliceProvider: { s in
+                                                        finishFromOffset = s
+                                                        return s < samples.count ? Array(samples[s...]) : []
+                                                    })
+                assert(res.text.lowercased().contains("your country"), "F2: finish after non-aborting stop transcribes the tail correctly")
+            } catch {
+                assert(false, "F2: finish after non-aborting stop failed: \(error)")
+            }
+            assert(finishFromOffset == fed, "F2: finish resumes the live stream at offset \(fed) instead of re-feeding from 0 (got \(finishFromOffset))")
+        }
+
+        // F3: integrity verification is memoized per file identity and invalidated by modification.
+        if let smallModel = AudioTranscriber.knownModels.first(where: { $0.filename == "asr4all-s" }),
+           AudioTranscriber.isModelInstalled(smallModel, at: smallPath) {
+            let cloneRoot = FileManager.default.temporaryDirectory.appendingPathComponent("voiceboy-clone-\(UUID().uuidString)")
+            let cloneDir = cloneRoot.appendingPathComponent("asr4all-s")
+            do {
+                try FileManager.default.createDirectory(at: cloneRoot, withIntermediateDirectories: true)
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: smallPath), to: cloneDir) // APFS clone
+                let first = AudioTranscriber.verifyKnownModelIntegrityIfMatched(at: cloneDir.path)
+                let s = Date()
+                let second = AudioTranscriber.verifyKnownModelIntegrityIfMatched(at: cloneDir.path)
+                let ms = Date().timeIntervalSince(s) * 1000
+                assert(first.isValid && second.isValid, "F3: clean bundle verifies")
+                assert(ms < 100, "F3: repeated verification is memoized (\(Int(ms)) ms)")
+                // Same-size in-place tamper of a verified file must invalidate the cache.
+                let meta = cloneDir.appendingPathComponent("metadata.json")
+                var bytes = try Data(contentsOf: meta)
+                bytes[bytes.count - 2] ^= 0x01
+                try bytes.write(to: meta)
+                let third = AudioTranscriber.verifyKnownModelIntegrityIfMatched(at: cloneDir.path)
+                assert(!third.isValid, "F3: modification after a cached success is detected")
+            } catch {
+                assert(false, "F3: failed to set up cloned bundle: \(error)")
+            }
+            try? FileManager.default.removeItem(at: cloneRoot)
+        }
+
+        // F4: only non-cancellation errors latch the live stream off for the session.
+        assert(!AppState.isFatalLiveStreamError(TranscriberError.transcriptionCancelled), "F4: cancellation is not fatal")
+        assert(AppState.isFatalLiveStreamError(TranscriberError.contextInitializationFailed("integrity")), "F4: integrity/load failure is fatal")
+        assert(AppState.isFatalLiveStreamError(TranscriberError.modelNotFound("/x")), "F4: missing model is fatal")
+
+        // F5: when paste is blocked by secure input, the text is not lost if the user allows clipboard copies.
+        let pb = NSPasteboard.general
+        TextPaster.secureInputOverrideForTesting = .globalSecureEventInput
+        TextPaster.resetDebounceForTesting()
+        pb.clearContents()
+        pb.setString("sentinel", forType: .string)
+        TextPaster.paste(text: "kept on clipboard", copyToClipboard: true)
+        assert(pb.string(forType: .string) == "kept on clipboard", "F5: blocked paste keeps text on clipboard when copyToClipboard is on")
+        TextPaster.resetDebounceForTesting()
+        pb.clearContents()
+        pb.setString("sentinel", forType: .string)
+        TextPaster.paste(text: "must not leak", copyToClipboard: false)
+        assert(pb.string(forType: .string) == "sentinel", "F5: blocked paste leaves clipboard untouched when copyToClipboard is off")
+        TextPaster.secureInputOverrideForTesting = nil
     }
 }
 

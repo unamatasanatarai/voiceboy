@@ -3,12 +3,18 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct Asr4allContext Asr4allContext;
+typedef struct Asr4allStream Asr4allStream;
+
+/// Atomic helpers for shared C/Swift cancellation flags (race-free under TSan).
+void asr4all_atomic_store_i32(int32_t* target, int32_t value);
+int32_t asr4all_atomic_load_i32(const int32_t* target);
 
 /// Initializes an ASR4ALL ONNX bundle context from `bundle_dir` (containing `metadata.json` and `asr4all.onnx.data`).
 /// Returns NULL on error and writes a human-readable message to `err_buf` if non-null.
@@ -39,7 +45,43 @@ int asr4all_transcribe(
     size_t err_buf_len
 );
 
-/// Frees a string returned by `asr4all_transcribe`.
+/// Begins an incremental streaming transcription session on `ctx`. Caller must free with `asr4all_stream_free`
+/// before calling `asr4all_free(ctx)`.
+Asr4allStream* asr4all_stream_begin(
+    Asr4allContext* ctx,
+    const char* tier_name,
+    bool apply_pcec,
+    char* err_buf,
+    size_t err_buf_len
+);
+
+/// Feeds newly captured 16 kHz mono PCM samples into an open stream and returns the current
+/// live punctuated transcript in `*out_text` (caller must free with `asr4all_free_string`).
+/// Returns 0 on success, -2 if aborted, -1 on error.
+int asr4all_stream_step(
+    Asr4allStream* stream,
+    const float* new_samples,
+    size_t n_samples,
+    char** out_text,
+    int* out_window_samples,
+    char* err_buf,
+    size_t err_buf_len
+);
+
+/// Flushes any trailing unconsumed PCM and PCEC tail on an open stream and returns the final transcript.
+/// Returns 0 on success, -2 if aborted, -1 on error.
+int asr4all_stream_finish(
+    Asr4allStream* stream,
+    char** out_text,
+    int* out_window_samples,
+    char* err_buf,
+    size_t err_buf_len
+);
+
+/// Frees an incremental stream handle.
+void asr4all_stream_free(Asr4allStream* stream);
+
+/// Frees a string returned by `asr4all_transcribe` or `asr4all_stream_*`.
 void asr4all_free_string(char* str);
 
 #ifdef __cplusplus

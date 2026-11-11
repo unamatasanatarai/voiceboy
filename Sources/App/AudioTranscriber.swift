@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public struct TranscriptionResult {
     public let text: String
@@ -85,9 +86,15 @@ public final class AudioTranscriber {
     private var currentModelPath: String?
     private var asr4allContext: OpaquePointer?
     private var currentAsr4allPath: String?
+    private var activeAsr4allStream: OpaquePointer?
+    private var activeStreamPath: String?
+    private var activeStreamSampleOffset: Int = 0
     private let queue = DispatchQueue(label: "org.futo.voiceboy.transcriber", qos: .userInitiated)
+    private let stateLock = NSLock()
+    private var abortGeneration: UInt64 = 0
     
-    // Issue 5 Fix: Pinned heap pointer for native ggml_abort_callback, immune to Swift exclusivity and copy-in/out
+    // Issue 5 Fix: Pinned heap pointer for native ggml_abort_callback, immune to Swift exclusivity and copy-in/out.
+    // All reads/writes go through C11 atomic helpers in asr4all_engine to eliminate TSan data races.
     private let abortFlagPtr: UnsafeMutablePointer<Int32>
     
     public static let shared = AudioTranscriber()
@@ -95,36 +102,92 @@ public final class AudioTranscriber {
     public init() {
         abortFlagPtr = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
         abortFlagPtr.initialize(to: 0)
+        asr4all_atomic_store_i32(abortFlagPtr, 0)
     }
     
     deinit {
-        abortFlagPtr.deallocate()
+        if let stream = activeAsr4allStream {
+            asr4all_stream_free(stream)
+            activeAsr4allStream = nil
+            activeStreamPath = nil
+        }
         if let ctx = context {
             whisper_free(ctx)
         }
         if let asrCtx = asr4allContext {
             asr4all_free(asrCtx)
         }
+        abortFlagPtr.deallocate()
+    }
+    
+    private func _abortUnlockedState() -> UInt64 {
+        asr4all_atomic_store_i32(abortFlagPtr, 1)
+        stateLock.lock()
+        abortGeneration &+= 1
+        let gen = abortGeneration
+        let asrCtx = asr4allContext
+        if let asrCtx = asrCtx {
+            asr4all_abort(asrCtx)
+        }
+        stateLock.unlock()
+        return gen
     }
     
     /// Requests immediate cancellation of any active in-flight whisper_full or ASR4ALL inference call.
     public func abortCurrentTranscription() {
-        abortFlagPtr.pointee = 1
-        if let asrCtx = asr4allContext {
-            asr4all_abort(asrCtx)
-        }
+        _ = _abortUnlockedState()
+    }
+    
+    /// Aborts any active inference and returns a new monotonically increasing generation token.
+    /// Tasks enqueued with an older generation token are rejected cleanly without racing on resetAbort().
+    @discardableResult
+    public func abortAndAdvanceGeneration() -> UInt64 {
+        return _abortUnlockedState()
+    }
+
+    /// Advances the generation token WITHOUT interrupting in-flight inference. Queued work minted with an older
+    /// token is still rejected, but a step that is already running completes and keeps its incremental stream
+    /// state, so a subsequent finish only has to process the unconsumed tail.
+    @discardableResult
+    public func advanceGenerationWithoutAbort() -> UInt64 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        abortGeneration &+= 1
+        return abortGeneration
     }
     
     /// Clears any pending cancellation request before starting a new dictation session.
     public func resetAbort() {
-        abortFlagPtr.pointee = 0
+        asr4all_atomic_store_i32(abortFlagPtr, 0)
+        stateLock.lock()
         if let asrCtx = asr4allContext {
             asr4all_reset_abort(asrCtx)
         }
+        stateLock.unlock()
+    }
+    
+    /// Clears cancellation ONLY if no abort/session-advance happened since `expectedGeneration` was minted.
+    public func resetAbort(ifMatchingGeneration expectedGeneration: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard abortGeneration == expectedGeneration else {
+            return false
+        }
+        asr4all_atomic_store_i32(abortFlagPtr, 0)
+        if let asrCtx = asr4allContext {
+            asr4all_reset_abort(asrCtx)
+        }
+        return true
+    }
+    
+    public var currentGeneration: UInt64 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return abortGeneration
     }
     
     public var isAborted: Bool {
-        return abortFlagPtr.pointee != 0
+        return asr4all_atomic_load_i32(abortFlagPtr) != 0
     }
     
     public enum ModelEngine: String, Hashable {
@@ -214,7 +277,7 @@ public final class AudioTranscriber {
         // English ASR4ALL Streaming Models (ONNX + PCEC)
         ModelInfo(
             filename: "asr4all-s",
-            displayName: "ASR4ALL Small",
+            displayName: "ASR4ALL Small (English)",
             category: "English (ASR4ALL)",
             parameterCount: "28M params (~106 MB)",
             bestFor: "Streaming CPU dictation - ultra fast",
@@ -241,7 +304,7 @@ public final class AudioTranscriber {
         ),
         ModelInfo(
             filename: "asr4all-m",
-            displayName: "ASR4ALL Medium",
+            displayName: "ASR4ALL Medium (English)",
             category: "English (ASR4ALL)",
             parameterCount: "56M params (~208 MB)",
             bestFor: "Balanced streaming CPU speed & accuracy",
@@ -268,7 +331,7 @@ public final class AudioTranscriber {
         ),
         ModelInfo(
             filename: "asr4all-l",
-            displayName: "ASR4ALL Large",
+            displayName: "ASR4ALL Large (English)",
             category: "English (ASR4ALL)",
             parameterCount: "97M params (~361 MB)",
             bestFor: "High-accuracy English streaming & PCEC",
@@ -295,7 +358,7 @@ public final class AudioTranscriber {
         ),
         ModelInfo(
             filename: "asr4all-s-plus",
-            displayName: "ASR4ALL Small+",
+            displayName: "ASR4ALL Small+ (English)",
             category: "English (ASR4ALL)",
             parameterCount: "33M params (~125 MB)",
             bestFor: "Fast streaming + speaker/diarization heads",
@@ -324,7 +387,7 @@ public final class AudioTranscriber {
         ),
         ModelInfo(
             filename: "asr4all-m-plus",
-            displayName: "ASR4ALL Medium+",
+            displayName: "ASR4ALL Medium+ (English)",
             category: "English (ASR4ALL)",
             parameterCount: "61M params (~229 MB)",
             bestFor: "Balanced streaming + speaker/diarization heads",
@@ -353,7 +416,7 @@ public final class AudioTranscriber {
         ),
         ModelInfo(
             filename: "asr4all-l-plus",
-            displayName: "ASR4ALL Large+",
+            displayName: "ASR4ALL Large+ (English)",
             category: "English (ASR4ALL)",
             parameterCount: "104M params (~386 MB)",
             bestFor: "Top ASR4ALL accuracy + speaker/diarization heads",
@@ -550,23 +613,158 @@ public final class AudioTranscriber {
         return nil
     }
     
-    private func _loadModelUnlocked(at path: String) throws {
-        if context != nil && currentModelPath == path {
-            return // Already loaded
+    // MARK: - Integrity Verification (Shared SHA-256 & Size Check)
+    public static func computeSHA256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while autoreleasepool(invoking: {
+            let chunk = handle.readData(ofLength: 1024 * 1024)
+            if chunk.isEmpty {
+                return false
+            }
+            hasher.update(data: chunk)
+            return true
+        }) {}
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+    
+    public static func verifyFileIntegrity(at url: URL, expectedSize: Int64, expectedSHA256: String) -> (isValid: Bool, error: String?) {
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let fileSize = attrs[.size] as? Int64 else {
+                return (false, "Could not determine file size for \(url.lastPathComponent)")
+            }
+            if fileSize != expectedSize {
+                return (false, "Integrity check failed for \(url.lastPathComponent): file size mismatch (expected \(expectedSize) bytes, got \(fileSize) bytes)")
+            }
+            let computedSHA = try computeSHA256(of: url)
+            if computedSHA.lowercased() != expectedSHA256.lowercased() {
+                return (false, "Integrity check failed for \(url.lastPathComponent): SHA-256 checksum mismatch (expected \(expectedSHA256), got \(computedSHA))")
+            }
+            return (true, nil)
+        } catch {
+            return (false, "Integrity check failed for \(url.lastPathComponent): \(error.localizedDescription)")
         }
+    }
+    
+    /// Identity of a file on disk; any write, replace, or rename-over changes at least one field.
+    private struct FileIdentity: Hashable {
+        let dev: Int32
+        let ino: UInt64
+        let size: Int64
+        let mtimeSec: Int
+        let mtimeNsec: Int
+        let ctimeSec: Int
+        let ctimeNsec: Int
+        let expectedSHA256: String
+    }
+
+    private static let verifiedFilesLock = NSLock()
+    private static var verifiedFiles: [String: FileIdentity] = [:]
+
+    private static func _fileIdentity(of url: URL, expectedSHA256: String) -> FileIdentity? {
+        var st = stat()
+        guard stat(url.path, &st) == 0 else { return nil }
+        return FileIdentity(
+            dev: st.st_dev,
+            ino: st.st_ino,
+            size: st.st_size,
+            mtimeSec: st.st_mtimespec.tv_sec,
+            mtimeNsec: st.st_mtimespec.tv_nsec,
+            ctimeSec: st.st_ctimespec.tv_sec,
+            ctimeNsec: st.st_ctimespec.tv_nsec,
+            expectedSHA256: expectedSHA256.lowercased()
+        )
+    }
+
+    /// Verifies a model file, skipping the full SHA-256 when this exact file (same inode, size, mtime, ctime)
+    /// already passed in this process. Only successes are cached.
+    private static func _verifyFileIntegrityMemoized(at url: URL, expectedSize: Int64, expectedSHA256: String) -> (isValid: Bool, error: String?) {
+        let key = url.standardizedFileURL.path
+        let before = _fileIdentity(of: url, expectedSHA256: expectedSHA256)
+        if let before = before {
+            verifiedFilesLock.lock()
+            let cached = verifiedFiles[key]
+            verifiedFilesLock.unlock()
+            if cached == before {
+                return (true, nil)
+            }
+        }
+        let result = verifyFileIntegrity(at: url, expectedSize: expectedSize, expectedSHA256: expectedSHA256)
+        verifiedFilesLock.lock()
+        if result.isValid, let before = before, _fileIdentity(of: url, expectedSHA256: expectedSHA256) == before {
+            verifiedFiles[key] = before
+        } else {
+            verifiedFiles.removeValue(forKey: key)
+        }
+        verifiedFilesLock.unlock()
+        return result
+    }
+
+    public static func verifyKnownModelIntegrityIfMatched(at path: String) -> (isValid: Bool, error: String?) {
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        guard let model = knownModels.first(where: { $0.filename == name }) else {
+            return (true, nil)
+        }
+        switch model.engine {
+        case .whisper:
+            return _verifyFileIntegrityMemoized(at: URL(fileURLWithPath: path), expectedSize: model.expectedSizeBytes, expectedSHA256: model.sha256)
+        case .asr4all:
+            let baseURL = URL(fileURLWithPath: path, isDirectory: true)
+            for file in model.bundleFiles {
+                let fileURL = baseURL.appendingPathComponent(file.relativePath)
+                let check = _verifyFileIntegrityMemoized(at: fileURL, expectedSize: file.expectedSizeBytes, expectedSHA256: file.sha256)
+                if !check.isValid {
+                    return check
+                }
+            }
+            return (true, nil)
+        }
+    }
+    
+    private func _freeActiveStreamUnlocked() {
+        stateLock.lock()
+        let oldStream = activeAsr4allStream
+        activeAsr4allStream = nil
+        activeStreamPath = nil
+        activeStreamSampleOffset = 0
+        stateLock.unlock()
+        if let stream = oldStream {
+            asr4all_stream_free(stream)
+        }
+    }
+    
+    private func _freeAllContextsUnlocked() {
+        _freeActiveStreamUnlocked()
         if let ctx = context {
             whisper_free(ctx)
             context = nil
             currentModelPath = nil
         }
-        if let asrCtx = asr4allContext {
+        stateLock.lock()
+        let oldAsrCtx = asr4allContext
+        asr4allContext = nil
+        currentAsr4allPath = nil
+        stateLock.unlock()
+        if let asrCtx = oldAsrCtx {
             asr4all_free(asrCtx)
-            asr4allContext = nil
-            currentAsr4allPath = nil
         }
+    }
+    
+    private func _loadModelUnlocked(at path: String) throws {
+        if context != nil && currentModelPath == path {
+            return // Already loaded
+        }
+        _freeAllContextsUnlocked()
         
         guard FileManager.default.fileExists(atPath: path) else {
             throw TranscriberError.modelNotFound(path)
+        }
+        let integrity = Self.verifyKnownModelIntegrityIfMatched(at: path)
+        guard integrity.isValid else {
+            throw TranscriberError.contextInitializationFailed(integrity.error ?? "Model integrity check failed")
         }
         
         var cparams = whisper_context_default_params()
@@ -584,15 +782,14 @@ public final class AudioTranscriber {
         if asr4allContext != nil && currentAsr4allPath == path {
             return
         }
-        if let asrCtx = asr4allContext {
-            asr4all_free(asrCtx)
-            asr4allContext = nil
-            currentAsr4allPath = nil
+        _freeAllContextsUnlocked()
+        
+        guard Self.isAsr4allBundle(at: path) else {
+            throw TranscriberError.modelNotFound(path)
         }
-        if let ctx = context {
-            whisper_free(ctx)
-            context = nil
-            currentModelPath = nil
+        let integrity = Self.verifyKnownModelIntegrityIfMatched(at: path)
+        guard integrity.isValid else {
+            throw TranscriberError.contextInitializationFailed(integrity.error ?? "ASR4ALL bundle integrity check failed")
         }
         
         var errBuf = [CChar](repeating: 0, count: 512)
@@ -600,8 +797,13 @@ public final class AudioTranscriber {
             let msg = String(cString: errBuf)
             throw TranscriberError.contextInitializationFailed(msg.isEmpty ? "asr4all_init failed for \(path)" : msg)
         }
+        stateLock.lock()
+        if self.isAborted {
+            asr4all_abort(newCtx)
+        }
         self.asr4allContext = newCtx
         self.currentAsr4allPath = path
+        stateLock.unlock()
     }
     
     /// Peak-normalizes quiet input so low-gain microphones produce usable log-mel features.
@@ -615,12 +817,28 @@ public final class AudioTranscriber {
         return samples.map { $0 * gain }
     }
 
+    private static func _cleanAsr4allText(_ recognized: String) -> String {
+        return recognized
+            .replacingOccurrences(of: "\u{FFFD}", with: "")
+            .replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Transcribes audio samples using FUTO Whisper ACFT or ASR4ALL ONNX models without translation.
     public func transcribe(audioData: AudioData,
                            modelPath: String? = nil,
                            useDynamicContext: Bool = true,
-                           language: String = "en") throws -> TranscriptionResult {
+                           language: String = "auto",
+                           expectedGeneration: UInt64? = nil) throws -> TranscriptionResult {
         return try queue.sync {
+            if let expectedGen = expectedGeneration {
+                guard self.resetAbort(ifMatchingGeneration: expectedGen) else {
+                    throw TranscriberError.transcriptionCancelled
+                }
+            } else if self.isAborted {
+                throw TranscriberError.transcriptionCancelled
+            }
+            
             let activeModelPath: String
             if let customPath = modelPath {
                 activeModelPath = customPath
@@ -686,13 +904,13 @@ public final class AudioTranscriber {
             // Suppress non-speech tokens (♪, *, brackets, etc.) that show up as stray symbols
             wparams.suppress_nst = true
             
-            // Issue 5 Fix: Hook ggml_abort_callback to enable instant cancellation mid-inference
+            // Issue 5 Fix: Hook ggml_abort_callback with atomic reads to enable instant race-free cancellation
             if self.isAborted {
                 throw TranscriberError.transcriptionCancelled
             }
             wparams.abort_callback = { userData in
                 guard let ptr = userData?.assumingMemoryBound(to: Int32.self) else { return false }
-                return ptr.pointee != 0
+                return asr4all_atomic_load_i32(ptr) != 0
             }
             wparams.abort_callback_user_data = UnsafeMutableRawPointer(self.abortFlagPtr)
             
@@ -724,6 +942,7 @@ public final class AudioTranscriber {
                 if let ctx = self.context {
                     whisper_free(ctx)
                     self.context = nil
+                    self.currentModelPath = nil
                 }
                 if self.isAborted {
                     throw TranscriberError.transcriptionCancelled
@@ -792,7 +1011,6 @@ public final class AudioTranscriber {
         if self.isAborted {
             throw TranscriberError.transcriptionCancelled
         }
-        asr4all_reset_abort(ctx)
         
         let dur = Double(samples.count) / 16000.0
         let tierName: String
@@ -843,10 +1061,7 @@ public final class AudioTranscriber {
             recognized = ""
         }
         
-        let cleanText = recognized
-            .replacingOccurrences(of: "\u{FFFD}", with: "")
-            .replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanText = Self._cleanAsr4allText(recognized)
         
         let isSilence = cleanText.isEmpty
         let audioDur = audioData.originalDurationSec
@@ -864,5 +1079,190 @@ public final class AudioTranscriber {
             modelName: modelName,
             isSilence: isSilence
         )
+    }
+    
+    /// Releases any in-flight incremental ASR4ALL stream asynchronously on the transcriber serial queue.
+    public func cancelAsr4allStreamAsync() {
+        queue.async {
+            self._freeActiveStreamUnlocked()
+        }
+    }
+    
+    private func _decodeAsr4allResult(
+        rc: Int32,
+        outTextPtr: UnsafeMutablePointer<CChar>?
+    ) throws -> String {
+        if self.isAborted || rc == -2 {
+            if let ptr = outTextPtr {
+                asr4all_free_string(ptr)
+            }
+            throw TranscriberError.transcriptionCancelled
+        }
+        if rc != 0 {
+            if let ptr = outTextPtr {
+                asr4all_free_string(ptr)
+            }
+            throw TranscriberError.transcriptionFailed(rc)
+        }
+        let recognized: String
+        if let ptr = outTextPtr {
+            recognized = String(cString: ptr)
+            asr4all_free_string(ptr)
+        } else {
+            recognized = ""
+        }
+        return Self._cleanAsr4allText(recognized)
+    }
+    
+    private func _ensureActiveStreamLocked(
+        modelPath: String,
+        tierName: String,
+        restart: Bool,
+        threads: Int32
+    ) throws -> OpaquePointer {
+        if asr4allContext == nil || currentAsr4allPath != modelPath {
+            try self._loadAsr4allUnlocked(at: modelPath, threads: threads)
+        }
+        guard let ctx = asr4allContext else {
+            throw TranscriberError.contextInitializationFailed("No active ASR4ALL context")
+        }
+        if restart || activeAsr4allStream == nil || activeStreamPath != modelPath {
+            _freeActiveStreamUnlocked()
+            var errBuf = [CChar](repeating: 0, count: 512)
+            guard let stream = asr4all_stream_begin(ctx, tierName, true, &errBuf, errBuf.count) else {
+                let msg = String(cString: errBuf)
+                throw TranscriberError.contextInitializationFailed(msg.isEmpty ? "asr4all_stream_begin failed" : msg)
+            }
+            stateLock.lock()
+            activeAsr4allStream = stream
+            activeStreamPath = modelPath
+            activeStreamSampleOffset = 0
+            stateLock.unlock()
+            return stream
+        }
+        return activeAsr4allStream!
+    }
+    
+    /// Feeds only newly captured PCM samples (since the last committed stream offset) into the stateful
+    /// ONNX ASR4ALL stream and returns the updated transcript preview in O(delta) time per tick.
+    public func stepAsr4allStream(
+        modelPath: String,
+        tierName: String = "stream_c16r4",
+        restartStream: Bool,
+        expectedGeneration: UInt64,
+        sampleSliceProvider: (_ fromOffset: Int) -> [Float]
+    ) throws -> (text: String, windowSamples: Int) {
+        return try queue.sync {
+            guard self.resetAbort(ifMatchingGeneration: expectedGeneration) else {
+                throw TranscriberError.transcriptionCancelled
+            }
+            let threads = Int32(min(8, max(1, AudioTranscriber.physicalCoreCount)))
+            let stream = try self._ensureActiveStreamLocked(
+                modelPath: modelPath,
+                tierName: tierName,
+                restart: restartStream,
+                threads: threads
+            )
+            
+            let newSamples = sampleSliceProvider(self.activeStreamSampleOffset)
+            var outTextPtr: UnsafeMutablePointer<CChar>? = nil
+            var outWindowSamples: Int32 = 0
+            var errBuf = [CChar](repeating: 0, count: 512)
+            
+            let rc: Int32 = newSamples.withUnsafeBufferPointer { buf in
+                asr4all_stream_step(
+                    stream,
+                    buf.baseAddress,
+                    buf.count,
+                    &outTextPtr,
+                    &outWindowSamples,
+                    &errBuf,
+                    errBuf.count
+                )
+            }
+            
+            do {
+                let text = try self._decodeAsr4allResult(rc: rc, outTextPtr: outTextPtr)
+                self.activeStreamSampleOffset += newSamples.count
+                return (text, Int(outWindowSamples))
+            } catch {
+                self._freeActiveStreamUnlocked()
+                throw error
+            }
+        }
+    }
+    
+    /// Feeds remaining trailing samples and flushes right-context padding + PCEC end-of-utterance,
+    /// freeing the active stream regardless of outcome.
+    public func finishAsr4allStream(
+        modelPath: String,
+        tierName: String = "stream_c16r4",
+        originalDurationSec: Double,
+        trimmedDurationSec: Double,
+        expectedGeneration: UInt64,
+        sampleSliceProvider: (_ fromOffset: Int) -> [Float]
+    ) throws -> TranscriptionResult {
+        return try queue.sync {
+            defer {
+                self._freeActiveStreamUnlocked()
+            }
+            guard self.resetAbort(ifMatchingGeneration: expectedGeneration) else {
+                throw TranscriberError.transcriptionCancelled
+            }
+            let threads = Int32(min(8, max(1, AudioTranscriber.physicalCoreCount)))
+            let stream = try self._ensureActiveStreamLocked(
+                modelPath: modelPath,
+                tierName: tierName,
+                restart: false,
+                threads: threads
+            )
+            
+            let start = DispatchTime.now()
+            let trailingSamples = sampleSliceProvider(self.activeStreamSampleOffset)
+            var outWindowSamples: Int32 = 0
+            var errBuf = [CChar](repeating: 0, count: 512)
+            
+            if !trailingSamples.isEmpty {
+                var stepTextPtr: UnsafeMutablePointer<CChar>? = nil
+                let stepRc: Int32 = trailingSamples.withUnsafeBufferPointer { buf in
+                    asr4all_stream_step(
+                        stream,
+                        buf.baseAddress,
+                        buf.count,
+                        &stepTextPtr,
+                        &outWindowSamples,
+                        &errBuf,
+                        errBuf.count
+                    )
+                }
+                _ = try self._decodeAsr4allResult(rc: stepRc, outTextPtr: stepTextPtr)
+                self.activeStreamSampleOffset += trailingSamples.count
+            }
+            
+            var finishTextPtr: UnsafeMutablePointer<CChar>? = nil
+            let finishRc = asr4all_stream_finish(
+                stream,
+                &finishTextPtr,
+                &outWindowSamples,
+                &errBuf,
+                errBuf.count
+            )
+            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000.0
+            let cleanText = try self._decodeAsr4allResult(rc: finishRc, outTextPtr: finishTextPtr)
+            let modelName = URL(fileURLWithPath: modelPath).lastPathComponent
+            let rtf = originalDurationSec > 0 ? (elapsedMs / 1000.0) / originalDurationSec : 0.0
+            
+            return TranscriptionResult(
+                text: cleanText,
+                originalDurationSec: originalDurationSec,
+                processedDurationSec: trimmedDurationSec,
+                inferenceDurationMs: elapsedMs,
+                realTimeFactor: rtf,
+                audioContextSize: Int(outWindowSamples / 640),
+                modelPath: modelPath,
+                modelName: modelName,
+                isSilence: cleanText.isEmpty
+            )
+        }
     }
 }

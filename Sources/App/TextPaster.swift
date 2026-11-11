@@ -1,5 +1,6 @@
 import Cocoa
 import ApplicationServices
+import Carbon
 
 public final class TextPaster {
     private static var lastPasteTimestamp: TimeInterval = 0
@@ -13,21 +14,43 @@ public final class TextPaster {
         lock.unlock()
     }
     
-    /// Checks if the frontmost focused UI element is a secure text input (password field)
-    public static func isTargetSecureInput() -> Bool {
-        guard AXIsProcessTrusted() else { return false }
-        let systemWide = AXUIElementCreateSystemWide()
-        var focusedElement: CFTypeRef?
-        let status = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
-        guard status == .success, let element = focusedElement else { return false }
-        
-        var subrole: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSubroleAttribute as CFString, &subrole) == .success,
-           let subroleStr = subrole as? String,
-           subroleStr == "AXSecureTextField" {
-            return true
+    public enum SecureInputReason {
+        /// The focused element is an AXSecureTextField.
+        case passwordField
+        /// Some process holds macOS Secure Event Input; the target cannot be inspected and may be a password field.
+        case globalSecureEventInput
+    }
+
+    /// Test hook to force a secure-input verdict; nil uses live system state.
+    public static var secureInputOverrideForTesting: SecureInputReason?
+
+    /// Returns why pasting should be blocked, preferring the precise AX verdict over the system-wide flag.
+    public static func secureInputBlockReason() -> SecureInputReason? {
+        if let forced = secureInputOverrideForTesting {
+            return forced
         }
-        return false
+        if AXIsProcessTrusted() {
+            let systemWide = AXUIElementCreateSystemWide()
+            var focusedElement: CFTypeRef?
+            let status = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
+            if status == .success, let element = focusedElement {
+                var subrole: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element as! AXUIElement, kAXSubroleAttribute as CFString, &subrole) == .success,
+                   let subroleStr = subrole as? String,
+                   subroleStr == "AXSecureTextField" {
+                    return .passwordField
+                }
+            }
+        }
+        if IsSecureEventInputEnabled() {
+            return .globalSecureEventInput
+        }
+        return nil
+    }
+
+    /// Checks if macOS Secure Event Input is active or the frontmost focused UI element is a password field.
+    public static func isTargetSecureInput() -> Bool {
+        return secureInputBlockReason() != nil
     }
     
     public static func paste(text: String, copyToClipboard: Bool = AppState.shared.copyToClipboard) {
@@ -36,15 +59,37 @@ public final class TextPaster {
         guard !trimmed.isEmpty else { return }
         
         // Security check (Scenario 10): Block injection into password / secure-entry fields
-        if isTargetSecureInput() {
+        if let reason = secureInputBlockReason() {
+            // Never type into a secure target, but don't silently lose the dictation either: if the user opted into
+            // clipboard copies, leave the text there so they can paste it themselves.
+            if copyToClipboard {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(trimmed, forType: .string)
+            }
+            let what = reason == .passwordField ? "Password field detected" : "Secure input is active (another app)"
+            let detail = copyToClipboard ? "\(what) — text copied to clipboard" : what
             DispatchQueue.main.async {
-                AppState.shared.statusMessage = "Dictation blocked: Password field detected"
-                ToastWindowController.shared.showToast(status: "Blocked", text: "Password field detected", audioLevel: 0.0)
+                AppState.shared.statusMessage = "Dictation blocked: \(detail)"
+                ToastWindowController.shared.showToast(status: "Blocked", text: detail, audioLevel: 0.0)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                     ToastWindowController.shared.hideToast()
                 }
             }
             return
+        }
+        
+        let axTrusted = AXIsProcessTrusted()
+        if !axTrusted {
+            let checkOptPrompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString
+            let options = [checkOptPrompt: true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+            if !copyToClipboard {
+                DispatchQueue.main.async {
+                    AppState.shared.statusMessage = "Accessibility permission required to auto-paste"
+                }
+                return
+            }
         }
         
         // Debounce protection: prevent duplicate paste calls within a 300ms window
@@ -81,12 +126,7 @@ public final class TextPaster {
         pasteboard.setString(trimmed, forType: .string)
         let expectedChangeCount = pasteboard.changeCount
         
-        // 3. Ensure accessibility permission is active
-        if !AXIsProcessTrusted() {
-            let checkOptPrompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString
-            let options = [checkOptPrompt: true] as CFDictionary
-            AXIsProcessTrustedWithOptions(options)
-        }
+        guard axTrusted else { return }
         
         // 4. Perform synthetic paste with adequate delay for modifier release
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {

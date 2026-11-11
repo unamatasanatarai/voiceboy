@@ -54,6 +54,28 @@ if [[ ! -f "$whisper_lib" ]]; then
         "${project_dir}/deps/whisper.cpp/build-static/ggml/src/ggml-blas/libggml-blas.a"
 fi
 
+# Ensure ONNX Runtime (macOS universal2, minOS 11.0+) is ready for ASR4ALL models
+ort_dir="${project_dir}/deps/onnxruntime"
+ort_version="1.19.2"
+ort_header="${ort_dir}/include/onnxruntime_c_api.h"
+ort_dylib="${ort_dir}/lib/libonnxruntime.${ort_version}.dylib"
+if [[ ! -f "$ort_header" || ! -f "$ort_dylib" ]]; then
+    printf '%s\n' "==> ONNX Runtime v${ort_version} missing; downloading macOS universal2 release..."
+    mkdir -p "$ort_dir"
+    ort_tgz="${cache_dir}/onnxruntime-osx-universal2-${ort_version}.tgz"
+    curl -L --fail --progress-bar \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-osx-universal2-${ort_version}.tgz" \
+        -o "$ort_tgz"
+    ort_tmp="${cache_dir}/ort-extract-$$"
+    rm -rf "$ort_tmp"
+    mkdir -p "$ort_tmp"
+    tar -xzf "$ort_tgz" -C "$ort_tmp"
+    rm -rf "${ort_dir}/include" "${ort_dir}/lib"
+    cp -R "${ort_tmp}/onnxruntime-osx-universal2-${ort_version}/include" "${ort_dir}/include"
+    cp -R "${ort_tmp}/onnxruntime-osx-universal2-${ort_version}/lib" "${ort_dir}/lib"
+    rm -rf "$ort_tmp" "$ort_tgz"
+fi
+
 # Increment and track build number
 build_num_file="${project_dir}/BUILD_NUMBER"
 if [[ -f "$build_num_file" ]]; then
@@ -76,9 +98,21 @@ bundle_id="${BUNDLE_ID}"
 app_dir="${build_dir}/${app_name}.app"
 contents_dir="${app_dir}/Contents"
 macos_dir="${contents_dir}/MacOS"
+frameworks_dir="${contents_dir}/Frameworks"
 resources_dir="${contents_dir}/Resources"
 
-mkdir -p "$macos_dir" "$resources_dir"
+mkdir -p "$macos_dir" "$frameworks_dir" "$resources_dir"
+
+cp -f "${ort_dylib}" "${frameworks_dir}/libonnxruntime.${ort_version}.dylib"
+ln -sf "libonnxruntime.${ort_version}.dylib" "${frameworks_dir}/libonnxruntime.dylib"
+
+asr4all_obj="${build_dir}/asr4all_engine.o"
+printf '%s\n' "Compiling ASR4ALL C++ ONNX engine..."
+clang++ -std=c++17 -O3 -mmacosx-version-min="${MIN_MACOS_VERSION}" \
+    -I "${ort_dir}/include" \
+    -I Sources/Engine \
+    -c Sources/Engine/asr4all_engine.cpp \
+    -o "$asr4all_obj"
 
 if [[ -f "VERSION" ]]; then
     cp "VERSION" "${resources_dir}/VERSION"
@@ -100,9 +134,16 @@ swiftc -sdk "$sdk_path" \
     -whole-module-optimization \
     -Xlinker -dead_strip \
     -import-objc-header Sources/BridgingHeader.h \
+    -I Sources/Engine \
+    -I "${ort_dir}/include" \
     -I deps/whisper.cpp/include \
     -I deps/whisper.cpp/ggml/include \
+    -Xlinker "$asr4all_obj" \
     -Xlinker "$whisper_lib" \
+    -L "${ort_dir}/lib" \
+    -lonnxruntime \
+    -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
+    -Xlinker -rpath -Xlinker "${ort_dir}/lib" \
     -lc++ \
     -framework Accelerate \
     -framework Metal \

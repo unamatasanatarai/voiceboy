@@ -69,14 +69,30 @@ IFS= read -r sdk_path <"$sdk_file"
 rm -f "$sdk_file"
 
 whisper_lib="${project_dir}/deps/whisper.cpp/build-static/libwhisper_all.a"
+ort_dir="${project_dir}/deps/onnxruntime"
+asr4all_obj="${project_dir}/build/asr4all_engine.o"
+
+if [[ ! -f "$asr4all_obj" || Sources/Engine/asr4all_engine.cpp -nt "$asr4all_obj" || Sources/Engine/asr4all_engine.h -nt "$asr4all_obj" ]]; then
+    clang++ -std=c++17 -O3 -mmacosx-version-min="${MIN_MACOS_VERSION}" \
+        -I "${ort_dir}/include" \
+        -I Sources/Engine \
+        -c Sources/Engine/asr4all_engine.cpp \
+        -o "$asr4all_obj"
+fi
 
 swiftc -sdk "$sdk_path" \
     -O \
     -whole-module-optimization \
     -import-objc-header Sources/BridgingHeader.h \
+    -I Sources/Engine \
+    -I "${ort_dir}/include" \
     -I deps/whisper.cpp/include \
     -I deps/whisper.cpp/ggml/include \
+    -Xlinker "$asr4all_obj" \
     -Xlinker "$whisper_lib" \
+    -L "${ort_dir}/lib" \
+    -lonnxruntime \
+    -Xlinker -rpath -Xlinker "${ort_dir}/lib" \
     -lc++ \
     -framework Accelerate \
     -framework Metal \

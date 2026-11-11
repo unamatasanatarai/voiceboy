@@ -125,8 +125,9 @@ public struct MinimalMainView: View {
     // Unified vertical pill control for models matching language and settings controls
     private var modelsVerticalControl: some View {
         let models = AudioTranscriber.knownModels
-        return VStack(spacing: 0) {
-            ForEach(0..<models.count, id: \.self) { index in
+        return ScrollView(.vertical, showsIndicators: true) {
+            VStack(spacing: 0) {
+                ForEach(0..<models.count, id: \.self) { index in
                 let model = models[index]
                 let isDownloaded = downloadManager.isModelDownloaded(model.filename)
                 let isDownloading = downloadManager.isDownloading(model.filename)
@@ -210,14 +211,16 @@ public struct MinimalMainView: View {
                         .opacity((isSelected || isNextSelected) ? 0 : 1)
                 }
             }
+            }
         }
+        .frame(height: 254)
         .background(MinimalMainView.bgInactive)
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
     
     // Vertical language segmented control matching logo height
     private var languageVerticalControl: some View {
-        let items = [("Polish", "pl"), ("English", "en"), ("Auto Detect", "auto")]
+        let items = [("Polish", "pl"), ("English", "en")]
         return VStack(spacing: 0) {
             ForEach(0..<items.count, id: \.self) { index in
                 let item = items[index]
@@ -239,7 +242,7 @@ public struct MinimalMainView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .frame(height: 30)
+                .frame(height: 45)
                 
                 if index < items.count - 1 {
                     let nextItem = items[index + 1]

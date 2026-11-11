@@ -49,6 +49,7 @@ struct VoiceBoyTests {
         testAudioEngineTapReentrancy()
         testContextReinitializationAfterAbort()
         testInFlightChunkAbortionOnStop()
+        testAsr4allModelsCatalogAndInference()
         
         print("\n--------------------------------------------------")
         print("Test Summary: \(passed) passed, \(failed) failed")
@@ -460,15 +461,16 @@ struct VoiceBoyTests {
         assert(hashMismatch.error?.contains("checksum mismatch") == true, "Checksum mismatch produces descriptive error message")
         
         // 4. Verify existing installed model integrity if present
-        let installed39URL = AudioTranscriber.xdgModelsDirectory.appendingPathComponent("futo-english-39.bin")
-        if FileManager.default.fileExists(atPath: installed39URL.path),
-           let info = AudioTranscriber.knownModels.first(where: { $0.filename == "futo-english-39.bin" }) {
-            let modelCheck = ModelDownloadManager.verifyFileIntegrity(
-                at: installed39URL,
-                expectedSize: info.expectedSizeBytes,
-                expectedSHA256: info.sha256
-            )
-            assert(modelCheck.isValid, "Locally installed futo-english-39.bin satisfies full cryptographically verified integrity")
+        for model in AudioTranscriber.knownModels {
+            let modelURL = AudioTranscriber.xdgModelsDirectory.appendingPathComponent(model.filename)
+            if model.engine == .whisper, FileManager.default.fileExists(atPath: modelURL.path) {
+                let modelCheck = ModelDownloadManager.verifyFileIntegrity(
+                    at: modelURL,
+                    expectedSize: model.expectedSizeBytes,
+                    expectedSHA256: model.sha256
+                )
+                assert(modelCheck.isValid, "Locally installed \(model.filename) satisfies full cryptographically verified integrity")
+            }
         }
     }
     
@@ -586,7 +588,7 @@ struct VoiceBoyTests {
         assert(resolvedDot == nil, "Traversal with relative dots returns nil")
         
         // 3. Legitimate model name
-        if let existing = AudioTranscriber.resolveModelPath(named: "futo-english-39.bin") {
+        if let existing = AudioTranscriber.resolveModelPath(named: "asr4all-s") {
             assert(FileManager.default.fileExists(atPath: existing), "Legitimate model name resolves to valid existing path: \(existing)")
         }
     }
@@ -870,6 +872,110 @@ struct VoiceBoyTests {
         assert(!appState.isRecording, "isRecording is false immediately on stop")
         
         appState.cancelRecording()
+    }
+    
+    // MARK: - ASR4ALL ONNX Models Catalog, Validation & Live Inference
+    static func testAsr4allModelsCatalogAndInference() {
+        print("\n[ASR4ALL] Testing ASR4ALL ONNX catalog, bundle specs, and live transcription...")
+        let expectedNames = [
+            "asr4all-s", "asr4all-m", "asr4all-l",
+            "asr4all-s-plus", "asr4all-m-plus", "asr4all-l-plus"
+        ]
+        
+        for removed in ["futo-english-39.bin", "voice-input-english-74.bin", "voice-input-english-244.bin"] {
+            assert(!AudioTranscriber.knownModels.contains(where: { $0.filename == removed }), "\(removed) removed from knownModels")
+        }
+        
+        for name in expectedNames {
+            let model = AudioTranscriber.knownModels.first(where: { $0.filename == name })
+            assert(model != nil, "knownModels contains \(name)")
+            guard let m = model else { continue }
+            
+            assert(m.engine == .asr4all, "\(name) uses .asr4all engine")
+            assert(!m.bundleFiles.isEmpty, "\(name) defines bundleFiles")
+            assert(AudioTranscriber.isEnglishOnlyModel(name), "\(name) is marked English-only")
+            
+            let sumBytes = m.bundleFiles.reduce(Int64(0)) { $0 + $1.expectedSizeBytes }
+            assert(m.expectedSizeBytes == sumBytes, "\(name) expectedSizeBytes matches sum of bundleFiles")
+            
+            for file in m.bundleFiles {
+                if let url = URL(string: file.downloadURL) {
+                    assert(ModelDownloadManager.isURLAllowedForDownload(url), "\(name)/\(file.relativePath) has allowed HTTPS URL")
+                } else {
+                    assert(false, "\(name)/\(file.relativePath) has invalid URL")
+                }
+                assert(file.expectedSizeBytes > 0, "\(name)/\(file.relativePath) expectedSizeBytes > 0")
+                assert(file.sha256.count == 64, "\(name)/\(file.relativePath) has 64-char SHA-256")
+            }
+            
+            if name.hasSuffix("-plus") {
+                assert(m.bundleFiles.contains(where: { $0.relativePath == "seg.onnx" }), "\(name) includes seg.onnx")
+                assert(m.bundleFiles.contains(where: { $0.relativePath == "sv.onnx" }), "\(name) includes sv.onnx")
+            }
+        }
+        
+        assert(!AudioTranscriber.isEnglishOnlyModel("voice-input-multilingual-74.bin"), "multilingual-74 is not English-only")
+        assert(!AudioTranscriber.isEnglishOnlyModel("voice-input-multilingual-244.bin"), "multilingual-244 is not English-only")
+        
+        // Incomplete directory must not be considered installed
+        if let smallModel = AudioTranscriber.knownModels.first(where: { $0.filename == "asr4all-s" }) {
+            let tmpBundle = FileManager.default.temporaryDirectory.appendingPathComponent("voiceboy-incomplete-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: tmpBundle, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpBundle) }
+            try? Data("{}".utf8).write(to: tmpBundle.appendingPathComponent("config.json"))
+            assert(!AudioTranscriber.isModelInstalled(smallModel, at: tmpBundle.path), "incomplete bundle dir is rejected")
+        }
+        
+        // Live inference check if local asr4all-s and jfk.wav are present
+        let jfkPath = FileManager.default.currentDirectoryPath + "/deps/whisper.cpp/samples/jfk.wav"
+        let smallPath = AudioTranscriber.xdgModelsDirectory.appendingPathComponent("asr4all-s").path
+        if let smallModel = AudioTranscriber.knownModels.first(where: { $0.filename == "asr4all-s" }),
+           AudioTranscriber.isModelInstalled(smallModel, at: smallPath),
+           let wavData = try? Data(contentsOf: URL(fileURLWithPath: jfkPath)) {
+            assert(AudioTranscriber.isAsr4allBundle(at: smallPath), "local asr4all-s detected as asr4all bundle")
+            
+            // Locate "data" subchunk in 16kHz mono 16-bit PCM WAV
+            var offset = 12
+            var samples: [Float] = []
+            while offset + 8 <= wavData.count {
+                let chunkID = String(data: wavData.subdata(in: offset..<(offset + 4)), encoding: .ascii)
+                let chunkSize = wavData.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
+                    Int($0.load(as: UInt32.self).littleEndian)
+                }
+                offset += 8
+                if chunkID == "data" && offset + chunkSize <= wavData.count {
+                    let count = chunkSize / 2
+                    samples.reserveCapacity(count)
+                    wavData.withUnsafeBytes { raw in
+                        let ptr = raw.baseAddress!.advanced(by: offset).assumingMemoryBound(to: Int16.self)
+                        for i in 0..<count {
+                            samples.append(Float(Int16(littleEndian: ptr[i])) / 32768.0)
+                        }
+                    }
+                    break
+                }
+                offset += chunkSize
+            }
+            
+            assert(!samples.isEmpty, "parsed jfk.wav samples")
+            do {
+                AudioTranscriber.shared.resetAbort()
+                let audioData = AudioData(
+                    samples: samples,
+                    originalDurationSec: Double(samples.count) / 16000.0,
+                    trimmedDurationSec: Double(samples.count) / 16000.0,
+                    sampleRate: 16000
+                )
+                let result = try AudioTranscriber.shared.transcribe(audioData: audioData, modelPath: smallPath, language: "en")
+                print("ASR4ALL-S transcription: \(result.text)")
+                let lower = result.text.lowercased()
+                assert(lower.contains("fellow america") && lower.contains("country can do for you"), "ASR4ALL-S transcribed jfk.wav accurately")
+            } catch {
+                assert(false, "ASR4ALL-S transcription failed: \(error)")
+            }
+        } else {
+            print("⚠️ Skipping live ASR4ALL inference (model or jfk.wav not present locally)")
+        }
     }
 }
 

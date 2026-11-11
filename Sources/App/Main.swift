@@ -9,7 +9,7 @@ func runCLI(arguments: [String]) {
                 currentCategory = model.category
                 print("[\(currentCategory) Models]")
             }
-            let isInstalled = AudioTranscriber.resolveModelPath(named: model.filename) != nil
+            let isInstalled = AudioTranscriber.findModelOnDisk(named: model.filename) != nil
             let tag = isInstalled ? "✅ INSTALLED" : "⬇️ AVAILABLE"
             print("  • \(model.displayName) (\(model.filename)) [\(tag)]")
             print("    Specs:    \(model.parameterCount)")
@@ -48,7 +48,7 @@ func runCLI(arguments: [String]) {
     
     var audioPath: String?
     var modelName = "voice-input-multilingual-244.bin"
-    var language = "auto"
+    var language = "en"
     var useDynamicContext = true
     var trimSilence = true
     

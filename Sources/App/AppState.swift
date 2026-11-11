@@ -7,7 +7,7 @@ public class AppState: ObservableObject {
     @Published public var isRecording: Bool = false
     @Published public var liveText: String = ""
     @Published public var lastTranscript: String = ""
-    @Published public var selectedModel: String = "futo-english-39.bin" {
+    @Published public var selectedModel: String = "asr4all-s" {
         didSet {
             UserDefaults.standard.set(selectedModel, forKey: AppState.selectedModelDefaultsKey)
         }
@@ -15,15 +15,19 @@ public class AppState: ObservableObject {
     @Published public var selectedLanguage: String = "en" {
         didSet {
             UserDefaults.standard.set(selectedLanguage, forKey: AppState.selectedLanguageDefaultsKey)
-            if selectedLanguage == "pl" && selectedModel.contains("english") {
+            if selectedLanguage == "pl" && AudioTranscriber.isEnglishOnlyModel(selectedModel) {
                 if ModelDownloadManager.shared.isModelDownloaded("voice-input-multilingual-74.bin") {
                     selectedModel = "voice-input-multilingual-74.bin"
                 } else if ModelDownloadManager.shared.isModelDownloaded("voice-input-multilingual-244.bin") {
                     selectedModel = "voice-input-multilingual-244.bin"
                 }
             } else if selectedLanguage == "en" && selectedModel.contains("multilingual") {
-                if ModelDownloadManager.shared.isModelDownloaded("futo-english-39.bin") {
-                    selectedModel = "futo-english-39.bin"
+                let englishCandidates = [
+                    "asr4all-s", "asr4all-m", "asr4all-l",
+                    "asr4all-s-plus", "asr4all-m-plus", "asr4all-l-plus"
+                ]
+                if let match = englishCandidates.first(where: { ModelDownloadManager.shared.isModelDownloaded($0) }) {
+                    selectedModel = match
                 }
             }
         }
@@ -130,10 +134,15 @@ public class AppState: ObservableObject {
             self.showDockIcon = false
         }
         
-        let lang = UserDefaults.standard.string(forKey: AppState.selectedLanguageDefaultsKey) ?? "en"
+        let savedLang = UserDefaults.standard.string(forKey: AppState.selectedLanguageDefaultsKey) ?? "en"
+        let lang = (savedLang == "pl" || savedLang == "en") ? savedLang : "en"
         self.selectedLanguage = lang
         
-        let initialModel = UserDefaults.standard.string(forKey: AppState.selectedModelDefaultsKey) ?? (lang == "pl" ? "voice-input-multilingual-74.bin" : "futo-english-39.bin")
+        let storedModel = UserDefaults.standard.string(forKey: AppState.selectedModelDefaultsKey)
+        let validStoredModel = storedModel.flatMap { name in
+            AudioTranscriber.knownModels.contains(where: { $0.filename == name }) ? name : nil
+        }
+        let initialModel = validStoredModel ?? (lang == "pl" ? "voice-input-multilingual-74.bin" : "asr4all-s")
         if let resolved = AudioTranscriber.resolveModelPath(named: initialModel, language: lang) {
             let actualName = URL(fileURLWithPath: resolved).lastPathComponent
             self.selectedModel = actualName

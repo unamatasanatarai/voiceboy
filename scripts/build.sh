@@ -197,7 +197,15 @@ cat <<EOF >"${contents_dir}/Info.plist"
 EOF
 
 printf '%s\n' "Signing ${app_name} bundle..."
-codesign --force --deep --sign - --requirements "=designated => identifier \"${bundle_id}\"" "$app_dir"
+# Sign inside-out: nested dylibs keep their own identity/requirement; the custom
+# designated requirement applies only to the main bundle (no --deep, which would
+# force it onto nested code and break the seal).
+for lib in "${frameworks_dir}"/*.dylib; do
+    [[ -L "$lib" ]] && continue
+    codesign --force --sign - "$lib"
+done
+codesign --force --sign - --requirements "=designated => identifier \"${bundle_id}\"" "$app_dir"
+codesign --verify --deep --strict "$app_dir"
 
 printf '%s\n' "Refreshing macOS LaunchServices cache..."
 touch "$app_dir"
